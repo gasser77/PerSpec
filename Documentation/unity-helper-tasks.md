@@ -293,7 +293,7 @@ Saves a GameObject from the current scene as a prefab asset.
 - Idempotent: Replaces existing prefab if it already exists
 
 ### SetListProperty
-Sets a list property on a ScriptableObject with multiple asset references.
+Sets a serialized `List<T>` field on any target: a ScriptableObject (`owner=*.asset`), a Prefab MonoBehaviour (`owner=*.prefab` + `path` + `component`), a scene-file MonoBehaviour (`owner=*.unity` + `path` + `component`), or an active-scene MonoBehaviour (`path` + `component`, no `owner`). Element types include primitives, strings, enums (parsed by enum-name), `Vector2/3/4`, `Color`, plus any `UnityEngine.Object` asset reference. Complex serialized structs use the `json` parameter (ScriptableObject targets only).
 
 **Simple lists (pipe-separated values):**
 ```json
@@ -603,6 +603,28 @@ Quality assurance tool - checks which translations are missing or empty.
 - `table` - Table name (optional, defaults to "General")
 - Logs comprehensive validation report to Unity Console
 
+### RemoveOrphanKeys
+Repairs a SharedData↔table desync in a String Table Collection. Removes rows whose
+`KeyId` has no SharedData key name (also any SharedData entry with a null/empty key).
+Such rows are unreachable via `GetString` (no key name to look them up), crash
+`ValidateKeys` / `UpdateAll` with `ArgumentNullException: key`, and corrupt the runtime
+`StringDatabase` load so **every** key in the table resolves to `[key]`.
+```json
+{
+    "type": "localization",
+    "action": "RemoveOrphanKeys",
+    "parameters": [
+        {"key": "table", "value": "General"},
+        {"key": "dryRun", "value": "true"}
+    ]
+}
+```
+- `table` - Table collection name (optional, defaults to "General")
+- `dryRun` - `"true"` reports orphan KeyIds (and en values) without modifying; `"false"` (default) removes them
+- Idempotent. Run `dryRun` first. Symptoms that call for it: `ValidateKeys`/`UpdateAll`
+  throw `Value cannot be null. Parameter name: key`, or the running game shows
+  `[some.key]` for keys that resolve fine in the editor.
+
 ### RenameKey
 Safely renames a key across all languages.
 ```json
@@ -746,6 +768,8 @@ Opens a prefab in Prefab Mode for editing.
 - Must be followed by `SavePrefab` to save changes
 - Stores confirmation message in `task.result`
 
+**Missing-script detection:** After opening, the prefab is scanned for GameObjects with missing `MonoBehaviour` script references. If any are found, the task **still succeeds** (returns `true`) but `task.result` is prefixed with `WARNING:` and lists the affected GameObject paths plus the unresolved script GUIDs (parsed from the prefab YAML). A `Debug.LogWarning` is also emitted to the Unity Console. Execution continues so scenarios that don't persist the prefab are unaffected; if a subsequent `SavePrefab` runs, Unity will refuse to write a prefab containing missing scripts and that task will fail with the natural error.
+
 ### SavePrefab
 Saves the currently open prefab and closes Prefab Mode.
 ```json
@@ -759,6 +783,31 @@ Saves the currently open prefab and closes Prefab Mode.
 - Must be called after `OpenPrefab` and any modifications
 - Returns error if no prefab stage is currently open
 - Stores saved prefab path in `task.result`
+
+**Missing-script pre-flight:** Before calling Unity's save API, the open prefab is re-scanned for missing-script slots. If any are present, the task **fails** with `task.error` describing the affected GameObject paths and the unresolved script GUIDs (parsed from the prefab YAML), and instructs the caller to run `RemoveMissingScripts` first. This replaces Unity's opaque generic save error with actionable detail.
+
+### RemoveMissingScripts
+Strips missing-script `MonoBehaviour` slots from the currently open prefab so `SavePrefab` can succeed afterward. Use this when `OpenPrefab` reported a missing-script warning or `SavePrefab` failed for that reason.
+```json
+{
+    "action": "RemoveMissingScripts",
+    "parameters": []
+}
+```
+With an optional sub-target:
+```json
+{
+    "action": "RemoveMissingScripts",
+    "parameters": [
+        {"key": "target", "value": "Console/sus_op_ctrl"}
+    ]
+}
+```
+- `target` (optional): GameObject path under the open prefab root (resolved via `FindInActiveContext`). Without it, the entire prefab root is walked.
+- Walks the (sub)tree, calls `GameObjectUtility.RemoveMonoBehavioursWithMissingScript` on each affected GameObject, and marks the stage dirty.
+- Requires a prefab to be currently open (`OpenPrefab` first). Returns error otherwise.
+- `task.result` reports the total slots removed and the list of GameObject paths that were cleaned. Empty result message ("No missing scripts found") when the (sub)tree was clean.
+- This action does **not** save — pair with `SavePrefab` to persist the cleanup.
 
 ### SetParentByTransform
 Sets the parent of a GameObject using Transform.Find() for Prefab Mode.
@@ -858,7 +907,7 @@ The old hardcoded `TestRunnerUIFlow` can now be expressed as a declarative JSON 
             {"action": "LoadScene", "parameters": [{"key": "path", "value": "Assets/Scenes/MainScene.unity"}]},
             {"action": "WaitForGameObject", "parameters": [{"key": "path", "value": "WelcomeSceneController"}, {"key": "timeout", "value": "10"}]},
             {"action": "TakeScreenshot", "parameters": [{"key": "outputDir", "value": "Assets/Screenshots/UIFlow"}, {"key": "filename", "value": "01_welcome"}]},
-            {"action": "CallMethod", "parameters": [{"key": "path", "value": "WelcomeSceneController"}, {"key": "component", "value": "Undugu.WelcomeSceneManager, Assembly-CSharp"}, {"key": "method", "value": "TestHelper_ClickLoginButton"}]},
+            {"action": "CallMethod", "parameters": [{"key": "path", "value": "WelcomeSceneController"}, {"key": "component", "value": "MyNamespace.WelcomeSceneManager, Assembly-CSharp"}, {"key": "method", "value": "TestHelper_ClickLoginButton"}]},
             {"action": "WaitForGameObject", "parameters": [{"key": "path", "value": "SignInSceneManager"}, {"key": "timeout", "value": "10"}]},
             {"action": "TakeScreenshot", "parameters": [{"key": "outputDir", "value": "Assets/Screenshots/UIFlow"}, {"key": "filename", "value": "02_signin"}]}
         ]
@@ -885,6 +934,368 @@ Reads component field values from a GameObject at runtime. **Works in Play mode!
 - Shows null/assigned state for Unity Object references
 - Can inspect private and public fields
 - **Use Case:** Debug component state, verify LoadVars() found references correctly
+
+### WrapWithParent
+Insert a new GameObject as an intermediate parent, either above a target (`mode=self`) or between a target and its existing children (`mode=children`). Preserves sibling order; auto-adds a stretched RectTransform when target is UI.
+```json
+{
+  "action": "WrapWithParent",
+  "parameters": [
+    { "key": "target", "value": "Canvas" },
+    { "key": "newParentName", "value": "SafeAreaRoot" },
+    { "key": "mode", "value": "children" }
+  ]
+}
+```
+**Parameters:**
+- `target` (required): Path of the GameObject to wrap or whose children to wrap.
+- `newParentName` (required): Name of the new GameObject.
+- `mode` (optional, default `"children"`):
+  - `"children"` → new GO becomes a child of target; target's existing children re-parent under it. Use for inserting a layout root (e.g., `SafeAreaRoot`) inside a Canvas.
+  - `"self"` → new GO becomes parent of target; target re-parents under it. Use for wrapping a single GO in a new container while keeping siblings.
+- `worldPositionStays` (optional, default `"false"`): Passed to `Transform.SetParent`.
+
+**Behavior:**
+- Auto-adds `RectTransform` to the new GO (stretched, zero-offset, pivot 0.5,0.5) when target has a `RectTransform`. Otherwise plain `Transform`.
+- Idempotent: re-running on an already-wrapped target returns success without modifying the scene.
+
+### AddComponentToMatching
+Add a component to every GameObject under `root` that passes a filter. Mirrors `SetPropertyOnMatching`'s filter model. Already-present components count as `alreadyHad`, not re-added.
+```json
+{
+  "action": "AddComponentToMatching",
+  "parameters": [
+    { "key": "root", "value": "Canvas" },
+    { "key": "component", "value": "Flexalon.FlexalonObject, Flexalon" },
+    { "key": "pathFilter", "value": "Layout" },
+    { "key": "maxDepth", "value": "3" }
+  ]
+}
+```
+**Parameters:**
+- `component` (required): Fully qualified type name of the component to add.
+- `root` (optional, default active scene root): Path of the subtree to walk.
+- `withComponent` (optional): Only match GameObjects that already have this component type.
+- `pathFilter` (optional): Substring filter on the GameObject's full scene path.
+- `maxDepth` (optional, default `-1` unlimited): Walk depth from each root.
+
+**Result JSON:** `{"matched":N,"added":M,"alreadyHad":K,"failed":F,"failures":[...]}`. Task succeeds when `failed == 0`.
+
+### Validate `hasComponent` leaf (extension)
+The `Validate` task's assertion grammar now accepts a `hasComponent` leaf that checks presence without requiring a field — use instead of `component`+`field`+`equals` when you only care that the component exists.
+```json
+{
+  "rules": [
+    {
+      "name": "canvas-has-dpi-scaler",
+      "target": { "root": "Canvas" },
+      "assert": { "hasComponent": "Flexalon.FlexalonDpiScaler, Flexalon" }
+    }
+  ]
+}
+```
+Composable with `not`/`all`/`any` like any other leaf.
+
+## Additional Scene Actions
+
+### ClosePrefab
+Closes the Prefab Stage opened by `OpenPrefab` and returns the editor view to the main scene. Does **not** save — pair with `SavePrefab` first if you need edits persisted. Idempotent: succeeds with `task.result = "No prefab stage was open"` when nothing is open.
+```json
+{ "action": "ClosePrefab", "parameters": [] }
+```
+- No parameters.
+
+### ReportMissingScripts
+Diagnostic action: scans a prefab for GameObjects with missing `MonoBehaviour` script slots and reports them via `task.result` without modifying the asset. Uses Unity APIs only (`PrefabUtility.LoadPrefabContents`, `EditorJsonUtility.ToJson`, `AssetDatabase.GetDependencies`) — no `.prefab` text parsing.
+```json
+{
+    "action": "ReportMissingScripts",
+    "parameters": [
+        { "key": "prefabPath", "value": "Assets/Prefabs/MyPrefab.prefab" }
+    ]
+}
+```
+- `prefabPath` (optional): scan this prefab via `PrefabUtility.LoadPrefabContents` (does not affect any open stage). When omitted, the currently open prefab stage is inspected instead.
+- Reports each affected GameObject + missing-slot count, plus a list of resolvable dependency GUIDs.
+- **Limitation:** orphan GUIDs (where both `.cs` and `.meta` were deleted) are not retrievable through Unity APIs — recover them via `git log --all --diff-filter=D` to identify deleted scripts.
+
+### SetActive
+Toggles `GameObject.activeSelf`. Searches inactive objects via `Resources.FindObjectsOfTypeAll` if `FindInActiveContext` doesn't resolve the path.
+```json
+{
+    "action": "SetActive",
+    "parameters": [
+        { "key": "path", "value": "HUD/HealthBar" },
+        { "key": "active", "value": "false" },
+        { "key": "recursive", "value": "false" }
+    ]
+}
+```
+- `path` (required): GameObject path.
+- `active` (required): `"true"` | `"false"`.
+- `recursive` (optional, default `"false"`): when true, walks the entire subtree.
+
+### SetSiblingIndex
+Sets the GameObject's order among its siblings via `Transform.SetSiblingIndex`. Useful for layout groups and UI ordering.
+```json
+{
+    "action": "SetSiblingIndex",
+    "parameters": [
+        { "key": "path", "value": "Canvas/Panel/Button" },
+        { "key": "index", "value": "0" }
+    ]
+}
+```
+- `path` (required): GameObject path.
+- `index` (required): integer; clamped by Unity to the parent's child count.
+
+### DuplicateGameObject
+Clones a GameObject (with all components and children) under the same parent. Idempotent: if a sibling with the resolved name already exists, succeeds without re-duplicating.
+```json
+{
+    "action": "DuplicateGameObject",
+    "parameters": [
+        { "key": "path", "value": "Spawners/Enemy" },
+        { "key": "newName", "value": "Enemy_Boss" }
+    ]
+}
+```
+- `path` (required): source GameObject.
+- `newName` (optional, default `<name>_Copy`): name for the clone.
+
+### MoveGameObject
+Re-parents a GameObject. Empty `newParent` moves to scene root.
+```json
+{
+    "action": "MoveGameObject",
+    "parameters": [
+        { "key": "path", "value": "OldParent/Item" },
+        { "key": "newParent", "value": "NewParent/Container" },
+        { "key": "worldPositionStays", "value": "false" }
+    ]
+}
+```
+- `path` (required): GameObject to move.
+- `newParent` (required): destination parent path; empty string for scene root.
+- `worldPositionStays` (optional, default `"false"`): passed to `Transform.SetParent`.
+
+### RemoveComponent
+Destroys a component on a GameObject. Idempotent: if the component is already absent, succeeds silently.
+```json
+{
+    "action": "RemoveComponent",
+    "parameters": [
+        { "key": "path", "value": "Canvas/Panel" },
+        { "key": "component", "value": "UnityEngine.UI.Image, UnityEngine.UI" }
+    ]
+}
+```
+- `path` (required): GameObject path.
+- `component` (required): assembly-qualified component type name.
+
+### RenameGameObject
+Renames a GameObject. Idempotent: if a GameObject with the target name already exists at the resolved location, succeeds without modifying anything.
+```json
+{
+    "action": "RenameGameObject",
+    "parameters": [
+        { "key": "path", "value": "Canvas/Panel/OldName" },
+        { "key": "newName", "value": "NewName" }
+    ]
+}
+```
+- `path` (required): GameObject path.
+- `newName` (required): new name (only the leaf name; doesn't move the GameObject).
+
+### SetParent
+Re-parents using `Transform.SetParent` (scene context). For Prefab Mode, prefer `SetParentByTransform` which uses `Transform.Find` from the prefab root.
+```json
+{
+    "action": "SetParent",
+    "parameters": [
+        { "key": "path", "value": "OldParent/Child" },
+        { "key": "parent", "value": "NewParent" }
+    ]
+}
+```
+- `path` (required): GameObject path.
+- `parent` (required): new parent path; empty string for scene root.
+
+### BatchSetProperty
+Sets multiple fields/properties on a single component in one task. Saves dispatch overhead for many sequential `SetProperty` calls.
+```json
+{
+    "action": "BatchSetProperty",
+    "parameters": [
+        { "key": "path", "value": "Canvas/Title" },
+        { "key": "component", "value": "TMPro.TextMeshProUGUI, Unity.TextMeshPro" },
+        { "key": "properties", "value": "{\"text\":\"Hello\",\"fontSize\":\"48\",\"color\":\"red\"}" }
+    ]
+}
+```
+- `path` (required): GameObject path.
+- `component` (required): assembly-qualified component type.
+- `properties` (required): JSON object mapping field/property name → value (each value parsed the same way `SetProperty` parses).
+
+### GetProperty
+Reads a field or readable property and returns the serialized value in `task.result`. Counterpart to `SetProperty`. Two forms:
+
+**Scene GameObject (path + component + field):**
+```json
+{
+    "action": "GetProperty",
+    "parameters": [
+        { "key": "path", "value": "Player" },
+        { "key": "component", "value": "MyGame.PlayerController, Assembly-CSharp" },
+        { "key": "field", "value": "health" }
+    ]
+}
+```
+
+**ScriptableObject asset (owner=*.asset + field):**
+```json
+{
+    "action": "GetProperty",
+    "parameters": [
+        { "key": "owner", "value": "Assets/DataService/LocalizationService.asset" },
+        { "key": "field", "value": "currentLanguage" }
+    ]
+}
+```
+- `path`+`component`+`field` for scene GameObjects, OR `owner`+`field` for ScriptableObject assets.
+- Reads non-public members too. Indexed properties return an error — use specific field/getter instead.
+- Result is JSON-friendly via `SerializeReflectedValue` (primitives, `Vector*`, `Color`, references encoded as paths/asset-paths).
+
+### FindObjects
+Walks the scene (or a subtree) and returns paths of GameObjects matching optional component-type and path-substring filters. Returns a JSON object in `task.result`: `{"count":N,"paths":[...]}`.
+```json
+{
+    "action": "FindObjects",
+    "parameters": [
+        { "key": "root", "value": "Canvas" },
+        { "key": "withComponent", "value": "UnityEngine.UI.Button, UnityEngine.UI" },
+        { "key": "pathFilter", "value": "Submit" },
+        { "key": "maxDepth", "value": "5" }
+    ]
+}
+```
+- `root` (optional, default active scene): subtree to walk; `"/"` or empty walks all scene roots.
+- `withComponent` (optional): assembly-qualified component type — match GameObjects with this component.
+- `pathFilter` (optional): substring match against the GameObject's full path.
+- `maxDepth` (optional, default `"-1"` unlimited).
+
+### SetPropertyOnMatching
+Combines `FindObjects` and `SetProperty`: walks a subtree, finds GameObjects matching filters, and sets one field on the named component for each. Returns `{"matched":N,"set":M,"skipped":K,"failures":[...]}` in `task.result`.
+```json
+{
+    "action": "SetPropertyOnMatching",
+    "parameters": [
+        { "key": "root", "value": "Canvas" },
+        { "key": "withComponent", "value": "UnityEngine.UI.Image, UnityEngine.UI" },
+        { "key": "field", "value": "color" },
+        { "key": "value", "value": "transparent" },
+        { "key": "pathFilter", "value": "Backdrop" },
+        { "key": "maxDepth", "value": "-1" }
+    ]
+}
+```
+- `root` (optional, default scene roots): subtree to walk.
+- `withComponent`, `field`, `value` (required): same semantics as `SetProperty`.
+- `pathFilter`, `maxDepth` (optional): same semantics as `FindObjects`.
+- Task succeeds when `failures.Length == 0`.
+
+### ApplyRecipe
+Invokes a user-authored **recipe** — a parameterized template of scene primitives. Recipes live in user JSON files and use `{{paramName}}` substitution. Schema: `{package_path}/Editor/Schemas/recipe.schema.json`.
+```json
+{
+    "action": "ApplyRecipe",
+    "parameters": [
+        { "key": "recipeFile", "value": "Assets/Recipes/wireframe-card.recipe.json" },
+        { "key": "params", "value": "{\"name\":\"FeatureCard\",\"parent\":\"Canvas/CardList\",\"title\":\"Hello\"}" }
+    ]
+}
+```
+- `recipeFile` (required): path to the recipe JSON.
+- `params` (optional, default `"{}"`): JSON object whose keys match `{{tokens}}` in the recipe body.
+- Pre-flight: any unresolved `{{token}}` after substitution causes the task to fail with the missing token name.
+- Inner tasks run via the same dispatch as scenarios; aggregate result reports per-task success/failure.
+
+### Validate
+Runs project-authored invariant rules against the active scene/prefab. Each rule has a `target` (GameObject selector) and an `assert` (composable predicate over components/fields). Schema: `{package_path}/Editor/Schemas/validator-rules.schema.json`.
+```json
+{
+    "action": "Validate",
+    "parameters": [
+        { "key": "rulesFile", "value": "Assets/Validators/canvas-rules.json" },
+        { "key": "strict", "value": "true" }
+    ]
+}
+```
+- `rulesFile` (required): path to the rules JSON file.
+- `strict` (optional, default `"true"`): when `true`, any rule violation fails the task; when `false`, violations are reported in `task.result` but the task succeeds.
+- Result: per-rule summary (rule name, targets matched, violations) plus aggregate counts.
+- See the **Validate `hasComponent` leaf (extension)** section for the assertion grammar.
+
+### SetImporterProperty
+Sets a field or property on the **AssetImporter** for a given asset (TextureImporter, ModelImporter, AudioImporter, etc.) and calls `SaveAndReimport()` to persist and reapply. Generic reflection-based — works on any AssetImporter subtype's public or non-public members. Use this instead of writing one-off editor scripts to flip import settings.
+```json
+{
+    "action": "SetImporterProperty",
+    "parameters": [
+        { "key": "assetPath", "value": "Assets/ScreenTextures/welcomescreenbackground.png" },
+        { "key": "field", "value": "spriteImportMode" },
+        { "key": "value", "value": "Single" },
+        { "key": "importerType", "value": "TextureImporter" }
+    ]
+}
+```
+- `assetPath` (required): path to the asset (Unity-format, starts with `Assets/`).
+- `field` (required): the importer field or property name (e.g., `spriteImportMode`, `textureType`, `mipmapEnabled`, `wrapMode`, `filterMode`, `npotScale`, `isReadable`).
+- `value` (required): value as a string. Parsed via `ConvertValue` — same rules as `SetProperty`: enums by name (`"Single"`, `"Sprite"`, `"Bilinear"`), bools (`"true"`/`"false"`), numbers, vectors (`"x,y"`), colors (`"#FFAA00"` or `"red"`).
+- `importerType` (optional): expected importer subtype name (e.g., `"TextureImporter"`, `"ModelImporter"`, `"AudioImporter"`). When provided, the task fails fast if the asset's actual importer is a different type — guards against accidentally touching the wrong asset class.
+- Calls `SaveAndReimport()` on success → asset is reimported in the same task, downstream tasks see the new state.
+- **Common pairings:** to convert a PNG to a Single sprite, often you need two calls: first `field=textureType, value=Sprite`, then `field=spriteImportMode, value=Single`. Most TextureImporters created via drag-drop default to `Default` textureType, which makes sprite-related fields no-op.
+
+### GetPlayerPref
+Read a key from Unity's `PlayerPrefs`. Returns a JSON object in `task.result`: `{"hasKey":bool,"key":"...","type":"...","value":...}`. When `hasKey:false`, no `type`/`value` fields are present.
+```json
+{
+    "action": "GetPlayerPref",
+    "parameters": [
+        { "key": "key",  "value": "Undugu_Language" },
+        { "key": "type", "value": "string" }
+    ]
+}
+```
+- `key` (required): the PlayerPrefs key name.
+- `type` (optional, default `"string"`): `"string" | "int" | "float"` — PlayerPrefs only stores these three. Wrong type silently returns the platform default for that type.
+
+### SetPlayerPref
+Write a key to `PlayerPrefs` and `PlayerPrefs.Save()` immediately (important in the Editor where Save isn't automatic).
+```json
+{
+    "action": "SetPlayerPref",
+    "parameters": [
+        { "key": "key",   "value": "Undugu_Language" },
+        { "key": "value", "value": "en" },
+        { "key": "type",  "value": "string" }
+    ]
+}
+```
+- `key`, `value` (required).
+- `type` (optional, default `"string"`): same as `GetPlayerPref`. `value` is parsed accordingly.
+
+### DeletePlayerPref
+Remove a key (or all keys when `key="*"`) from `PlayerPrefs`. Idempotent.
+```json
+{
+    "action": "DeletePlayerPref",
+    "parameters": [
+        { "key": "key", "value": "Undugu_Language" }
+    ]
+}
+```
+- `key` (required): the PlayerPrefs key to delete; pass `"*"` to call `PlayerPrefs.DeleteAll()` (use with care).
 
 ## Common Mistakes to Avoid
 

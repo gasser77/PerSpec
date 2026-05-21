@@ -21,5 +21,19 @@ namespace PerSpec.UnityHelper.Editor
             task.error = $"No executor registered for type: {task.type}";
             return false;
         }
+
+        /// <summary>
+        /// Expose IsAsyncTask so non-UI coordinators can respect async tasks.
+        /// Casts to BaseTaskExecutor since IsAsyncTask is defined there (not on ITaskExecutor).
+        /// </summary>
+        public static bool IsAsyncTask(Task task)
+        {
+            if (_executors.TryGetValue(task.type, out var executor))
+            {
+                if (executor is BaseTaskExecutor bte)
+                    return bte.IsAsyncTask(task);
+            }
+            return false;
+        }
     }
 }

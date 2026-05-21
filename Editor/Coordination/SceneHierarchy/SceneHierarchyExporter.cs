@@ -193,8 +193,11 @@ namespace PerSpec.Editor.Coordination
                 {
                     if (component == null) continue;
 
-                    // Skip Transform as it's already exported separately
-                    if (component is Transform) continue;
+                    // Skip vanilla Transform (data already in the `transform` block).
+                    // Do NOT skip RectTransform — its anchorMin/Max, sizeDelta, pivot,
+                    // offsetMin/Max are only accessible via its SerializedProperty iterator,
+                    // not via the simple transform block.
+                    if (component is Transform && !(component is RectTransform)) continue;
 
                     try
                     {

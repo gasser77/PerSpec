@@ -1,0 +1,94 @@
+{
+    "$schema": "http://json-schema.org/draft-07/schema#",
+    "$id": "https://perspec.digitraver.com/schemas/scenario.schema.json",
+    "title": "PerSpec Scenario File",
+    "description": "UnityHelper scenario JSON file — drives UnityHelper actions via unityhelper_coordinator.py or ScenarioRunner UI.",
+    "type": "object",
+    "required": ["scenarios"],
+    "additionalProperties": false,
+    "properties": {
+        "scenarios": {
+            "type": "array",
+            "items": { "$ref": "#/definitions/Scenario" }
+        }
+    },
+    "definitions": {
+        "Scenario": {
+            "type": "object",
+            "required": ["name", "taskGroups"],
+            "properties": {
+                "name": { "type": "string" },
+                "description": { "type": "string" },
+                "continueOnError": { "type": "boolean", "default": false },
+                "status": { "type": "string", "enum": ["pending", "running", "completed", "failed"] },
+                "lastRun": { "type": "string" },
+                "taskGroups": {
+                    "type": "array",
+                    "items": { "$ref": "#/definitions/TaskGroup" }
+                },
+                "tasks": {
+                    "type": "array",
+                    "items": { "$ref": "#/definitions/Task" }
+                }
+            }
+        },
+        "TaskGroup": {
+            "type": "object",
+            "required": ["name", "tasks"],
+            "properties": {
+                "name": { "type": "string" },
+                "description": { "type": "string" },
+                "tasks": {
+                    "type": "array",
+                    "items": { "$ref": "#/definitions/Task" }
+                },
+                "subGroups": {
+                    "type": "array",
+                    "items": { "$ref": "#/definitions/TaskGroup" }
+                },
+                "expanded": { "type": "boolean" }
+            }
+        },
+        "Task": {
+            "type": "object",
+            "required": ["action", "parameters"],
+            "properties": {
+                "type": { "type": "integer", "default": 0, "description": "Executor type: 0=SCENE, 1=LOCALIZATION" },
+                "action": {
+                    "type": "string",
+                    "enum": [
+                        "CreateScene", "LoadScene", "AddGameObject", "AddComponent", "InstantiatePrefab",
+                        "SetProperty", "SetTransform", "SetRectTransform", "SaveScene", "CreateCanvas",
+                        "DeleteGameObject", "AddToBuildSettings", "RenameGameObject", "CreateScriptableObject",
+                        "SaveAsPrefab", "ExportHierarchy", "ExportHierarchyPrefab", "ExportHierarchyScene",
+                        "InspectGameObject", "SetListProperty", "TakeScreenshot", "WaitForGameObject",
+                        "CallMethod", "SetParent", "SetParentByTransform", "SetActive", "SetSiblingIndex",
+                        "DuplicateGameObject", "MoveGameObject", "RemoveComponent", "BatchSetProperty",
+                        "GetProperty", "FindObjects", "ApplyRecipe", "SetPropertyOnMatching", "Validate",
+                        "WrapWithParent", "AddComponentToMatching",
+                        "OpenPrefab", "SavePrefab", "ClosePrefab",
+                        "RemoveMissingScripts", "ReportMissingScripts",
+                        "SetImporterProperty",
+                        "GetPlayerPref", "SetPlayerPref", "DeletePlayerPref"
+                    ]
+                },
+                "parameters": {
+                    "type": "array",
+                    "items": { "$ref": "#/definitions/TaskParameter" }
+                },
+                "status": { "type": "string", "enum": ["pending", "running", "success", "failed"] },
+                "error": { "type": "string" },
+                "result": { "type": "string" }
+            }
+        },
+        "TaskParameter": {
+            "type": "object",
+            "required": ["key", "value"],
+            "additionalProperties": false,
+            "properties": {
+                "key": { "type": "string" },
+                "value": { "type": "string" }
+            }
+        }
+    }
+}

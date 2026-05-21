@@ -1,0 +1,43 @@
+{
+    "$schema": "http://json-schema.org/draft-07/schema#",
+    "$id": "https://perspec.digitraver.com/schemas/recipe.schema.json",
+    "title": "PerSpec Recipe File",
+    "description": "User-authored composition of SCENE primitives with {{param}} substitution. Invoked via the ApplyRecipe action. Package-specific patterns (Flexalon cards, Normcore rooms, etc.) live in user recipes — NOT in UnityHelper core.",
+    "type": "object",
+    "required": ["name", "tasks"],
+    "additionalProperties": false,
+    "properties": {
+        "name": {
+            "type": "string",
+            "description": "Recipe identifier; conventionally matches the file name stem (e.g. 'wireframe-card' for wireframe-card.recipe.json)."
+        },
+        "description": { "type": "string" },
+        "params": {
+            "type": "array",
+            "items": { "type": "string" },
+            "description": "Required parameter names. When ApplyRecipe is invoked, the caller must supply every name listed here. Unresolved {{param}} tokens in the body cause the task to fail."
+        },
+        "tasks": {
+            "type": "array",
+            "description": "Sequence of SCENE primitive actions to execute. Each task body may contain {{param}} tokens that the ApplyRecipe loader substitutes before parsing.",
+            "items": {
+                "type": "object",
+                "required": ["action", "parameters"],
+                "properties": {
+                    "action": { "type": "string" },
+                    "parameters": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "required": ["key", "value"],
+                            "properties": {
+                                "key": { "type": "string" },
+                                "value": { "type": "string" }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}

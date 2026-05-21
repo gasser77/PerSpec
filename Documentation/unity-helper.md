@@ -41,8 +41,9 @@ All C# code lives in the package under `Editor/UnityHelper/`:
 | **Task Registry** | `TaskExecutorRegistry.cs` | Maps task types to executor instances |
 | **Base Executor** | `BaseTaskExecutor.cs` | Abstract base with parameter helpers and async support |
 | **ITaskExecutor** | `ITaskExecutor.cs` | Interface contract for all executors |
-| **Scene Executor** | `SceneTaskExecutor.cs` | 27 scene/asset/component actions |
+| **Scene Executor** | `SceneTaskExecutor.cs` | 47 scene/asset/component actions |
 | **Localization Executor** | `LocalizationTaskExecutor.cs` | 17 localization actions (requires `com.unity.localization`) |
+| **TMP Executor** | `TmproTaskExecutor.cs` | 4 TextMeshPro-specific actions |
 
 Python CLI:
 

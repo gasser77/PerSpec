@@ -92,6 +92,29 @@ namespace PerSpec.UnityHelper.Editor
         private static DateTime _executionStartTime;
         private static bool _pollingEnabled = true;
 
+        // State machine for async-aware execution across editor frames.
+        // When a task is async (IsAsyncTask returns true), we park execution here and
+        // resume on subsequent OnEditorUpdate ticks after task.asyncCompleted is set.
+        private class ExecutionState
+        {
+            public ScenarioExecutionRequest Request;
+            public ScenarioConfig Config;
+            public string ScenariosPath;
+            public ScenarioExecutionOptions Options;
+            public List<QueueEntry> Queue;
+            public int Index;
+            public ExecutionResult Result = new ExecutionResult();
+            public Task PendingAsyncTask;
+            public Scenario PendingAsyncScenario;
+            public HashSet<Scenario> TouchedScenarios = new HashSet<Scenario>();
+        }
+        private class QueueEntry
+        {
+            public Scenario Scenario;
+            public Task Task;
+        }
+        private static ExecutionState _execState;
+
         static ScenarioExecutorCoordinator()
         {
             // Check if PerSpec is initialized by looking for its directory
@@ -130,6 +153,7 @@ namespace PerSpec.UnityHelper.Editor
 #if HAS_UNITY_LOCALIZATION
                 TaskExecutorRegistry.Register(new LocalizationTaskExecutor());
 #endif
+                TaskExecutorRegistry.Register(new TmproTaskExecutor());
 
                 EditorApplication.update += OnEditorUpdate;
                 _lastCheckTime = EditorApplication.timeSinceStartup;
@@ -147,6 +171,20 @@ namespace PerSpec.UnityHelper.Editor
         {
             if (!_pollingEnabled || _connection == null)
                 return;
+
+            // Step the execution state machine every frame while active —
+            // CHECK_INTERVAL gates DB polling only, not in-progress execution.
+            if (_isExecuting && _execState != null)
+            {
+                if ((DateTime.Now - _executionStartTime).TotalSeconds > EXECUTION_TIMEOUT)
+                {
+                    Debug.LogWarning($"[ScenarioExecutorCoordinator] Execution timeout for request {_currentRequestId}");
+                    FinalizeExecution(false);
+                    return;
+                }
+                StepExecution();
+                return;
+            }
 
             if (EditorApplication.timeSinceStartup - _lastCheckTime < CHECK_INTERVAL)
                 return;
@@ -202,6 +240,7 @@ namespace PerSpec.UnityHelper.Editor
             Debug.Log($"[ScenarioExecutorCoordinator] Starting: {request.Target} from {request.ScenariosFile}");
             UpdateRequestStatus(request.Id, "running");
 
+            // Initialize the state machine on next tick; StepExecution drives it.
             EditorApplication.delayCall += () =>
             {
                 try
@@ -217,21 +256,206 @@ namespace PerSpec.UnityHelper.Editor
                     string json = File.ReadAllText(scenariosPath);
                     var config = JsonUtility.FromJson<ScenarioConfig>(json);
 
-                    var result = ExecuteTarget(config, request.Target, options);
+                    var queue = BuildQueueForTarget(config, request.Target, options);
 
-                    string updatedJson = JsonUtility.ToJson(config, true);
-                    File.WriteAllText(scenariosPath, updatedJson);
-                    AssetDatabase.Refresh();
-
-                    UpdateRequestResults(request.Id, result);
-                    CompleteExecution(result.Failed == 0, result.Message, result.Failed > 0 ? result.ErrorMessage : null);
+                    _execState = new ExecutionState
+                    {
+                        Request = request,
+                        Config = config,
+                        ScenariosPath = scenariosPath,
+                        Options = options,
+                        Queue = queue,
+                        Index = 0,
+                    };
+                    Debug.Log($"[ScenarioExecutorCoordinator] Queued {queue.Count} task(s) for execution");
                 }
                 catch (Exception e)
                 {
-                    Debug.LogError($"[ScenarioExecutorCoordinator] Execution failed: {e.Message}");
+                    Debug.LogError($"[ScenarioExecutorCoordinator] Execution init failed: {e.Message}");
+                    _execState = null;
                     CompleteExecution(false, null, e.Message);
                 }
             };
+        }
+
+        // Build a flat (scenario, task) queue honoring the same target routing
+        // logic as ExecuteTarget. Returns empty list on unknown target; caller handles.
+        private static List<QueueEntry> BuildQueueForTarget(ScenarioConfig config, string target, ScenarioExecutionOptions options)
+        {
+            var queue = new List<QueueEntry>();
+
+            if (target == "all")
+            {
+                foreach (var scenario in config.scenarios)
+                    AppendScenarioTasks(queue, scenario, GetAllTasks(scenario));
+                return queue;
+            }
+
+            if (target.StartsWith("scenario:"))
+            {
+                var parts = target.Split(':');
+                int scenarioIdx = int.Parse(parts[1]);
+                if (scenarioIdx < 0 || scenarioIdx >= config.scenarios.Count)
+                    return queue; // empty → Finalize will mark failed
+                var scenario = config.scenarios[scenarioIdx];
+
+                if (parts.Length >= 4 && parts[2] == "group")
+                {
+                    int groupIdx = int.Parse(parts[3]);
+                    if (scenario.taskGroups == null || groupIdx >= scenario.taskGroups.Count)
+                        return queue;
+                    AppendScenarioTasks(queue, scenario, GetTasksFromGroup(scenario.taskGroups[groupIdx]));
+                    return queue;
+                }
+
+                AppendScenarioTasks(queue, scenario, GetAllTasks(scenario));
+                return queue;
+            }
+
+            var namedScenario = config.scenarios.Find(s => s.name == target);
+            if (namedScenario != null)
+                AppendScenarioTasks(queue, namedScenario, GetAllTasks(namedScenario));
+            return queue;
+        }
+
+        private static void AppendScenarioTasks(List<QueueEntry> queue, Scenario scenario, List<Task> tasks)
+        {
+            foreach (var t in tasks)
+                queue.Add(new QueueEntry { Scenario = scenario, Task = t });
+        }
+
+        // State machine step. Drives the queue one task per tick and honors async tasks.
+        private static void StepExecution()
+        {
+            var state = _execState;
+            if (state == null) return;
+
+            // Is there a pending async task from the prior tick?
+            if (state.PendingAsyncTask != null)
+            {
+                if (!state.PendingAsyncTask.asyncCompleted)
+                    return; // still waiting — check again next tick
+
+                // Async task finished — collect its result.
+                var async = state.PendingAsyncTask;
+                bool asyncOk = async.asyncSuccess;
+                if (asyncOk)
+                {
+                    async.status = "success";
+                    async.error = "";
+                    state.Result.Success++;
+                }
+                else
+                {
+                    async.status = "failed";
+                    state.Result.Failed++;
+                    state.Result.ErrorMessage = async.error;
+                    Debug.LogError($"[ScenarioExecutorCoordinator] Async task failed: {async.action} — {async.error}");
+                    FinalizeExecution(false);
+                    return;
+                }
+                state.PendingAsyncTask = null;
+                state.PendingAsyncScenario = null;
+            }
+
+            // Done?
+            if (state.Index >= state.Queue.Count)
+            {
+                FinalizeExecution(state.Result.Failed == 0);
+                return;
+            }
+
+            // Pick next task.
+            var entry = state.Queue[state.Index];
+            state.Index++;
+            state.TouchedScenarios.Add(entry.Scenario);
+            entry.Scenario.status = "running";
+
+            state.Result.Total++;
+
+            if (!ShouldExecuteTask(entry.Task, state.Options))
+                return; // skipped; continue next tick
+
+            entry.Task.status = "running";
+            entry.Task.isAsync = false;
+            entry.Task.asyncCompleted = false;
+            entry.Task.asyncSuccess = false;
+
+            bool syncOk;
+            try
+            {
+                syncOk = TaskExecutorRegistry.ExecuteTask(entry.Task);
+            }
+            catch (Exception e)
+            {
+                entry.Task.status = "failed";
+                entry.Task.error = e.Message;
+                state.Result.Failed++;
+                state.Result.ErrorMessage = e.Message;
+                Debug.LogError($"[ScenarioExecutorCoordinator] Task exception: {entry.Task.action} — {e.Message}");
+                FinalizeExecution(false);
+                return;
+            }
+
+            // Async? park and resume later.
+            if (syncOk && TaskExecutorRegistry.IsAsyncTask(entry.Task))
+            {
+                entry.Task.isAsync = true;
+                state.PendingAsyncTask = entry.Task;
+                state.PendingAsyncScenario = entry.Scenario;
+                return;
+            }
+
+            // Sync result.
+            if (syncOk)
+            {
+                entry.Task.status = "success";
+                entry.Task.error = "";
+                state.Result.Success++;
+            }
+            else
+            {
+                entry.Task.status = "failed";
+                state.Result.Failed++;
+                state.Result.ErrorMessage = entry.Task.error;
+                Debug.LogError($"[ScenarioExecutorCoordinator] Task failed: {entry.Task.action} — {entry.Task.error}");
+                FinalizeExecution(false);
+            }
+        }
+
+        private static void FinalizeExecution(bool overallSuccess)
+        {
+            var state = _execState;
+            if (state == null)
+            {
+                CompleteExecution(overallSuccess, null, overallSuccess ? null : "Finalize called without state");
+                return;
+            }
+
+            // Update per-scenario status for all scenarios we touched.
+            foreach (var scenario in state.TouchedScenarios)
+                UpdateScenarioStatus(scenario);
+
+            state.Result.Message = $"Completed: {state.Result.Success}/{state.Result.Total} tasks successful, {state.Result.Failed} failed";
+
+            // Write back the scenarios file with updated statuses.
+            try
+            {
+                string updatedJson = JsonUtility.ToJson(state.Config, true);
+                File.WriteAllText(state.ScenariosPath, updatedJson);
+                AssetDatabase.Refresh();
+            }
+            catch (Exception e)
+            {
+                Debug.LogError($"[ScenarioExecutorCoordinator] Failed to write scenarios file: {e.Message}");
+            }
+
+            UpdateRequestResults(state.Request.Id, state.Result);
+
+            string msg = state.Result.Message;
+            string err = state.Result.Failed > 0 ? state.Result.ErrorMessage : null;
+            _execState = null;
+            CompleteExecution(state.Result.Failed == 0, msg, err);
         }
 
         private static ExecutionResult ExecuteTarget(ScenarioConfig config, string target, ScenarioExecutionOptions options)

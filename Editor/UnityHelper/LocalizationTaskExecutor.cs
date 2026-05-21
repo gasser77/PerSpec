@@ -8,6 +8,7 @@ using UnityEngine.Localization;
 using UnityEngine.Localization.Settings;
 using UnityEditor.Localization;
 using System.IO;
+using PerSpec.Runtime.Localization;
 
 namespace PerSpec.UnityHelper.Editor
 {
@@ -55,6 +56,8 @@ namespace PerSpec.UnityHelper.Editor
                         return ImportTableFromCSV(task);
                     case "UpdateAll":
                         return UpdateAllLocalizations(task);
+                    case "RemoveOrphanKeys":
+                        return RemoveOrphanKeys(task);
                     default:
                         task.error = $"Unknown localization action: {task.action}";
                         return false;
@@ -67,21 +70,80 @@ namespace PerSpec.UnityHelper.Editor
             }
         }
 
+        /// <summary>
+        /// Creates a LocalizationSettings asset (if missing), registers it as the project's active
+        /// settings, and optionally walks <c>Assets/Localization/</c> for any existing Locale
+        /// assets and adds them to the AvailableLocales list.
+        ///
+        /// Optional params:
+        ///   settingsPath       — where to save the .asset. Default: Assets/Localization/LocalizationSettings.asset
+        ///   registerExisting   — "true"/"false". Default: "true". When true, every Locale asset
+        ///                        under Assets/Localization/ is added to the new settings.
+        ///   localesFolder      — folder to scan for Locale assets. Default: Assets/Localization
+        /// </summary>
         private bool CreateLocalizationSettings(Task task)
         {
+            string settingsPath    = GetOptionalParam(task, "settingsPath",    "Assets/Localization/LocalizationSettings.asset");
+            string localesFolder   = GetOptionalParam(task, "localesFolder",   "Assets/Localization");
+            bool   registerExisting = GetOptionalParam(task, "registerExisting", "true") == "true";
+
             try
             {
-                // Check if LocalizationSettings already exists
-                var existingSettings = LocalizationEditorSettings.ActiveLocalizationSettings;
-                if (existingSettings != null)
+                // Idempotent fast path — if active settings already exist, only register existing
+                // Locales that aren't yet on the list. Useful when an SO exists but is empty.
+                var settings = LocalizationEditorSettings.ActiveLocalizationSettings;
+                bool created = false;
+                if (settings == null)
                 {
-                    return true; // Already exists, idempotent
+                    string folder = Path.GetDirectoryName(settingsPath);
+                    if (!string.IsNullOrEmpty(folder) && !Directory.Exists(folder))
+                    {
+                        Directory.CreateDirectory(folder);
+                    }
+
+                    settings = ScriptableObject.CreateInstance<LocalizationSettings>();
+                    settings.name = Path.GetFileNameWithoutExtension(settingsPath);
+                    AssetDatabase.CreateAsset(settings, settingsPath);
+                    LocalizationEditorSettings.ActiveLocalizationSettings = settings;
+                    created = true;
+                    Debug.Log($"[LocalizationTaskExecutor] Created LocalizationSettings at {settingsPath}");
                 }
 
-                // Unity doesn't provide a programmatic way to create LocalizationSettings
-                // User must create it manually once via Unity Editor UI
-                task.error = "CreateLocalizationSettings requires manual setup: Open 'Window > Asset Management > Localization Tables' in Unity Editor. It will prompt you to create LocalizationSettings. Click 'Create' and then run this scenario again.";
-                return false;
+                int registered = 0;
+                int alreadyPresent = 0;
+                if (registerExisting && Directory.Exists(localesFolder))
+                {
+                    var existingProjectLocales = LocalizationEditorSettings.GetLocales();
+                    var alreadyRegisteredCodes = new HashSet<string>(
+                        existingProjectLocales != null
+                            ? existingProjectLocales.Select(l => l != null ? l.Identifier.Code : null).Where(c => c != null)
+                            : System.Linq.Enumerable.Empty<string>());
+
+                    var localeGuids = AssetDatabase.FindAssets("t:Locale", new[] { localesFolder });
+                    foreach (var guid in localeGuids)
+                    {
+                        string path = AssetDatabase.GUIDToAssetPath(guid);
+                        var locale = AssetDatabase.LoadAssetAtPath<Locale>(path);
+                        if (locale == null) continue;
+                        if (alreadyRegisteredCodes.Contains(locale.Identifier.Code))
+                        {
+                            alreadyPresent++;
+                            continue;
+                        }
+                        LocalizationEditorSettings.AddLocale(locale, false);
+                        registered++;
+                    }
+                }
+
+                EditorUtility.SetDirty(settings);
+                AssetDatabase.SaveAssets();
+                AssetDatabase.Refresh();
+
+                task.result = created
+                    ? $"Created LocalizationSettings at {settingsPath}; registered {registered} Locale asset(s) (already-present: {alreadyPresent})"
+                    : $"LocalizationSettings already existed; registered {registered} additional Locale asset(s) (already-present: {alreadyPresent})";
+                Debug.Log($"[LocalizationTaskExecutor] {task.result}");
+                return true;
             }
             catch (Exception ex)
             {
@@ -479,6 +541,9 @@ namespace PerSpec.UnityHelper.Editor
             string value = GetParam(task, "value");
             string language = GetOptionalParam(task, "language", "en");
             string tableName = GetOptionalParam(task, "table", "General");
+            string shape = GetOptionalParam(task, "shape", "");
+
+            value = MaybeShape(value, language, shape);
 
             if (string.IsNullOrEmpty(key))
             {
@@ -548,9 +613,14 @@ namespace PerSpec.UnityHelper.Editor
                     entry.Value = value;
                 }
 
-                // Save changes
+                // Save changes — SharedData carries the key→ID map (mutated by AddEntry via
+                // SharedData.AddKey). Without dirtying it, the new key is held in memory until
+                // the next domain reload, then discarded. The per-locale value persists (table is
+                // dirtied), but the key it points to vanishes — entries become orphaned.
                 EditorUtility.SetDirty(table);
                 EditorUtility.SetDirty(collection);
+                if (collection.SharedData != null)
+                    EditorUtility.SetDirty(collection.SharedData);
                 AssetDatabase.SaveAssets();
 
                 return true;
@@ -641,8 +711,11 @@ namespace PerSpec.UnityHelper.Editor
                     EditorUtility.SetDirty(targetTable);
                 }
 
-                // Save changes
+                // Save changes — see SetString comment: SharedData carries key→ID map and
+                // must be dirtied for new keys (added via AddEntry → SharedData.AddKey) to persist.
                 EditorUtility.SetDirty(collection);
+                if (collection.SharedData != null)
+                    EditorUtility.SetDirty(collection.SharedData);
                 AssetDatabase.SaveAssets();
 
                 return true;
@@ -659,6 +732,7 @@ namespace PerSpec.UnityHelper.Editor
             string filePath = GetParam(task, "filePath");
             string language = GetOptionalParam(task, "language", "en");
             string tableName = GetOptionalParam(task, "table", "General");
+            string shape = GetOptionalParam(task, "shape", "");
 
             if (string.IsNullOrEmpty(filePath))
             {
@@ -725,6 +799,8 @@ namespace PerSpec.UnityHelper.Editor
                     if (string.IsNullOrEmpty(key))
                         continue;
 
+                    value = MaybeShape(value, language, shape);
+
                     // Add or update entry
                     var entry = table.GetEntry(key);
                     if (entry == null)
@@ -741,6 +817,8 @@ namespace PerSpec.UnityHelper.Editor
 
                 EditorUtility.SetDirty(table);
                 EditorUtility.SetDirty(collection);
+                if (collection.SharedData != null)
+                    EditorUtility.SetDirty(collection.SharedData);
                 AssetDatabase.SaveAssets();
 
                 Debug.Log($"[LocalizationTaskExecutor] BulkSetStrings: Added {addedCount} new, updated {updatedCount} from '{filePath}'");
@@ -854,6 +932,118 @@ namespace PerSpec.UnityHelper.Editor
             catch (Exception ex)
             {
                 task.error = $"DeleteString failed for key '{key}': {ex.Message}";
+                return false;
+            }
+        }
+
+        /// <summary>
+        /// Removes corrupt/orphan entries from a String Table Collection that desync
+        /// SharedTableData and the per-locale tables. Two orphan classes:
+        ///  (a) SharedTableData entries whose Key name is null/empty — these make
+        ///      StringTableEntry.Key return null, so GetEntry(null) throws
+        ///      ArgumentNullException("key") and aborts ValidateKeys / UpdateAll and
+        ///      can break the runtime StringDatabase load (every key resolves to
+        ///      "[key]"). This is the bug LocalizationRules.md §11 warns about.
+        ///  (b) per-locale table rows whose KeyId has no SharedTableData entry.
+        /// Pass dryRun="true" to report without modifying. Idempotent.
+        /// </summary>
+        private bool RemoveOrphanKeys(Task task)
+        {
+            string tableName = GetOptionalParam(task, "table", "General");
+            bool dryRun = GetOptionalParam(task, "dryRun", "false") == "true";
+
+            try
+            {
+                var settings = LocalizationEditorSettings.ActiveLocalizationSettings;
+                if (settings == null)
+                {
+                    task.error = "RemoveOrphanKeys failed: LocalizationSettings not found.";
+                    return false;
+                }
+
+                var collection = LocalizationEditorSettings.GetStringTableCollection(tableName);
+                if (collection == null)
+                {
+                    task.error = $"RemoveOrphanKeys failed: String table '{tableName}' not found.";
+                    return false;
+                }
+
+                var shared = collection.SharedData;
+                if (shared == null)
+                {
+                    task.error = $"RemoveOrphanKeys failed: SharedData null for '{tableName}'.";
+                    return false;
+                }
+
+                var locales = LocalizationEditorSettings.GetLocales();
+
+                // (a) SharedData entries with null/empty key name.
+                var emptyNameIds = shared.Entries
+                    .Where(e => string.IsNullOrEmpty(e.Key))
+                    .Select(e => e.Id)
+                    .Distinct()
+                    .ToList();
+
+                // (b) per-locale table rows whose KeyId is absent / empty in SharedData.
+                var danglingByLocale = new List<string>();
+                var danglingIds = new HashSet<long>();
+                var sampleValues = new List<string>();
+                foreach (var locale in locales)
+                {
+                    var table = collection.GetTable(locale.Identifier) as UnityEngine.Localization.Tables.StringTable;
+                    if (table == null) continue;
+                    foreach (var entry in table.Values.ToList())
+                    {
+                        if (string.IsNullOrEmpty(shared.GetKey(entry.KeyId)))
+                        {
+                            danglingIds.Add(entry.KeyId);
+                            danglingByLocale.Add($"{locale.Identifier.Code}:{entry.KeyId}");
+                            if (locale.Identifier.Code == "en")
+                            {
+                                var v = entry.Value ?? "";
+                                sampleValues.Add($"{entry.KeyId}=\"{(v.Length > 40 ? v.Substring(0, 40) : v)}\"");
+                            }
+                        }
+                    }
+                }
+                Debug.LogWarning($"[LocalizationTaskExecutor] RemoveOrphanKeys dangling en values: {string.Join(" | ", sampleValues)}");
+
+                var allIds = new HashSet<long>(emptyNameIds);
+                foreach (var id in danglingIds) allIds.Add(id);
+
+                string summary = $"table='{tableName}' emptyNameSharedIds=[{string.Join(",", emptyNameIds)}] " +
+                                  $"danglingTableRows=[{string.Join(",", danglingByLocale)}] total={allIds.Count}";
+                Debug.LogWarning($"[LocalizationTaskExecutor] RemoveOrphanKeys ({(dryRun ? "DRY-RUN" : "APPLY")}): {summary}");
+
+                if (dryRun || allIds.Count == 0)
+                {
+                    task.result = (allIds.Count == 0 ? "No orphans found. " : "") + summary;
+                    return true;
+                }
+
+                foreach (var id in allIds)
+                {
+                    foreach (var locale in locales)
+                    {
+                        var table = collection.GetTable(locale.Identifier) as UnityEngine.Localization.Tables.StringTable;
+                        if (table == null) continue;
+                        table.Remove(id);
+                        EditorUtility.SetDirty(table);
+                    }
+                    shared.RemoveKey(id);
+                }
+
+                EditorUtility.SetDirty(shared);
+                EditorUtility.SetDirty(collection);
+                AssetDatabase.SaveAssets();
+                AssetDatabase.Refresh();
+
+                task.result = $"Removed {allIds.Count} orphan(s). {summary}";
+                return true;
+            }
+            catch (Exception ex)
+            {
+                task.error = $"RemoveOrphanKeys failed for '{tableName}': {ex.Message}";
                 return false;
             }
         }
@@ -1043,6 +1233,8 @@ namespace PerSpec.UnityHelper.Editor
 
                 EditorUtility.SetDirty(table);
                 EditorUtility.SetDirty(collection);
+                if (collection.SharedData != null)
+                    EditorUtility.SetDirty(collection.SharedData);
                 AssetDatabase.SaveAssets();
 
                 return true;
@@ -1093,6 +1285,20 @@ namespace PerSpec.UnityHelper.Editor
                 Debug.Log($"[LocalizationTaskExecutor] === Validation Report for table '{tableName}' ===");
                 Debug.Log($"Source language: {sourceLanguage}, Total keys: {sourceTable.Count}");
 
+                // Robustness guard: a SharedTableData<->table desync can leave entries whose
+                // resolved Key name is null/empty (orphan). StringTable.GetEntry(null) throws
+                // ArgumentNullException("key") and aborts the whole validation. Detect and
+                // report orphans once instead of crashing (LocalizationRules.md §11 — desync
+                // surfacing). KeyId is logged so the bad entry can be removed.
+                var orphanKeyIds = new List<long>();
+                foreach (var sourceEntry in sourceTable.Values)
+                {
+                    if (string.IsNullOrEmpty(sourceEntry.Key))
+                        orphanKeyIds.Add(sourceEntry.KeyId);
+                }
+                if (orphanKeyIds.Count > 0)
+                    Debug.LogWarning($"[LocalizationTaskExecutor] ORPHAN: {orphanKeyIds.Count} '{tableName}' source entr{(orphanKeyIds.Count == 1 ? "y has" : "ies have")} a null/empty SharedData key name. KeyIds: {string.Join(", ", orphanKeyIds)}");
+
                 var projectLocalesForValidation = LocalizationEditorSettings.GetLocales();
                 foreach (var targetLocale in projectLocalesForValidation)
                 {
@@ -1108,6 +1314,8 @@ namespace PerSpec.UnityHelper.Editor
 
                     foreach (var sourceEntry in sourceTable.Values)
                     {
+                        if (string.IsNullOrEmpty(sourceEntry.Key))
+                            continue; // orphan — reported once above; GetEntry(null) would throw
                         var targetEntry = targetTable.GetEntry(sourceEntry.Key);
                         if (targetEntry == null)
                             missingKeys.Add(sourceEntry.Key);
@@ -1546,6 +1754,36 @@ namespace PerSpec.UnityHelper.Editor
 
             result.Add(currentValue.ToString());
             return result.ToArray();
+        }
+
+        // Optional shaping pre-pass for SetString / BulkSetStrings.
+        // shape="arabic" — always run ArabicShaper.Shape on the value.
+        // shape="auto"   — run ArabicShaper.Shape if the locale code starts with ar/fa/ur/ps/sd/ku.
+        // shape="" or unrecognized — pass-through.
+        private static string MaybeShape(string value, string language, string shape)
+        {
+            if (string.IsNullOrEmpty(value) || string.IsNullOrEmpty(shape)) return value;
+            string s = shape.Trim().ToLowerInvariant();
+            string shaped = null;
+            if (s == "arabic")
+            {
+                shaped = ArabicShaper.Shape(value);
+            }
+            else if (s == "auto")
+            {
+                if (string.IsNullOrEmpty(language)) return value;
+                string lc = language.Trim().ToLowerInvariant();
+                if (lc == "ar" || lc.StartsWith("ar-") ||
+                    lc == "fa" || lc.StartsWith("fa-") ||
+                    lc == "ur" || lc.StartsWith("ur-") ||
+                    lc == "ps" || lc.StartsWith("ps-") ||
+                    lc == "sd" || lc.StartsWith("sd-") ||
+                    lc == "ku" || lc.StartsWith("ku-"))
+                {
+                    shaped = ArabicShaper.Shape(value);
+                }
+            }
+            return shaped ?? value;
         }
     }
 }

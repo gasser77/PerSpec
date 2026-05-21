@@ -47,6 +47,87 @@ def get_db_path():
     return perspec_dir / "test_coordination.db"
 
 
+def get_package_schemas_dir():
+    """
+    Locate the PerSpec Editor/Schemas directory.
+    Reads PerSpec/package_location.txt (first line = relative path; second line = absolute).
+    Falls back to None if the file or directory is missing — validation is skipped gracefully.
+    """
+    try:
+        project_root = get_project_root()
+        pkg_loc = project_root / "PerSpec" / "package_location.txt"
+        if not pkg_loc.exists():
+            return None
+        for line in pkg_loc.read_text().splitlines():
+            s = line.strip()
+            if not s or s.startswith("#"):
+                continue
+            candidate = Path(s) if Path(s).is_absolute() else (project_root / s)
+            schemas = candidate / "Editor" / "Schemas"
+            if schemas.exists():
+                return schemas
+    except Exception:
+        pass
+    return None
+
+
+def validate_scenario_file(scenarios_file_path, skip=False):
+    """
+    Validate a scenario JSON file against scenario.schema.json before submission.
+    Returns (ok, error_message). On missing jsonschema library or schema file, returns (True, "")
+    with a one-line notice so execution proceeds (graceful degradation).
+    """
+    if skip:
+        return True, ""
+
+    try:
+        import jsonschema  # type: ignore
+    except ImportError:
+        print("Note: jsonschema not installed — skipping pre-execution validation "
+              "(pip install jsonschema to enable; or pass --skip-schema-validation to silence)")
+        return True, ""
+
+    schemas_dir = get_package_schemas_dir()
+    if schemas_dir is None:
+        return True, ""  # Package not yet configured with schemas.
+
+    schema_path = schemas_dir / "scenario.schema.json"
+    if not schema_path.exists():
+        return True, ""
+
+    target = Path(scenarios_file_path)
+    if not target.is_absolute():
+        target = get_project_root() / target
+    if not target.exists():
+        return False, f"Scenarios file not found: {scenarios_file_path}"
+
+    try:
+        with open(schema_path) as f:
+            schema = json.load(f)
+        with open(target) as f:
+            data = json.load(f)
+    except json.JSONDecodeError as e:
+        return False, f"JSON parse error in {target}: {e}"
+    except Exception as e:
+        return False, f"Schema load error: {e}"
+
+    try:
+        validator = jsonschema.Draft7Validator(schema)
+        errors = sorted(validator.iter_errors(data), key=lambda e: list(e.absolute_path))
+        if not errors:
+            return True, ""
+        # Format up to the first 5 errors with paths.
+        lines = [f"Schema validation failed ({len(errors)} error(s)):"]
+        for err in errors[:5]:
+            path = "/".join(str(p) for p in err.absolute_path) or "(root)"
+            lines.append(f"  [{path}] {err.message}")
+        if len(errors) > 5:
+            lines.append(f"  ... and {len(errors) - 5} more.")
+        return False, "\n".join(lines)
+    except Exception as e:
+        return False, f"Schema validation error: {e}"
+
+
 TABLE_NAME = "scenario_execution_requests"
 
 CREATE_TABLE_SQL = f"""
@@ -331,6 +412,8 @@ def main():
     execute_parser.add_argument('--timeout', type=int, default=300, help='Wait timeout in seconds')
     execute_parser.add_argument('--focus', action='store_true',
                                help='Focus Unity window before submitting request')
+    execute_parser.add_argument('--skip-schema-validation', action='store_true',
+                               help='Skip pre-execution scenario-JSON schema validation')
 
     # Status command
     status_parser = subparsers.add_parser('status', help='Check request status')
@@ -418,6 +501,13 @@ def main():
                 else:
                     print(f"Use 'python unityhelper_coordinator.py status {request_id}' to check progress")
                 return
+
+            # Pre-execution schema validation.
+            ok, err = validate_scenario_file(args.file, skip=args.skip_schema_validation)
+            if not ok:
+                print(err)
+                print("Pass --skip-schema-validation to bypass for ad-hoc runs.")
+                sys.exit(1)
 
             request_id = coordinator.submit_request(
                 scenarios_file=args.file,

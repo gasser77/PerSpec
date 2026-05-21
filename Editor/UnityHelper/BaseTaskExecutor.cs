@@ -8,7 +8,8 @@ namespace PerSpec.UnityHelper.Editor
         public enum ExecutorType
         {
             SCENE,
-            LOCALIZATION
+            LOCALIZATION,
+            TMPRO
         }
 
         public abstract ExecutorType Type { get; }

@@ -98,73 +98,138 @@ def focus_unity_macos():
     """
     Bring Unity Editor window to foreground on macOS.
     Uses AppleScript via osascript (no external dependencies).
-    
+
+    Strategy:
+    1. Find Unity process by looking for process names containing "Unity"
+    2. Use System Events to set frontmost and raise window
+    3. Verify Unity is actually frontmost after activation
+
     Returns:
         bool: True if Unity was successfully focused, False otherwise
     """
-    
-    # Method 1: Simple activation
-    script_simple = 'tell application "Unity" to activate'
-    
-    # Method 2: System Events with process search (more robust)
-    script_robust = '''
+
+    # Primary method: Use System Events to find and focus Unity process
+    # This works regardless of how Unity is installed or named
+    script_focus = '''
     tell application "System Events"
-        set unityProcesses to (name of every process whose name contains "Unity")
-        if (count of unityProcesses) > 0 then
-            set processName to item 1 of unityProcesses
-            tell process processName
-                set frontmost to true
-                if windows is not {} then
+        -- Find Unity process (handles "Unity", "Unity Hub", "Unity 6000.x", etc.)
+        set unityProc to ""
+        set allProcs to name of every process whose background only is false
+        repeat with procName in allProcs
+            if procName contains "Unity" and procName does not contain "Unity Hub" then
+                set unityProc to procName as text
+                exit repeat
+            end if
+        end repeat
+
+        if unityProc is "" then
+            return "NOTFOUND"
+        end if
+
+        -- Activate the process
+        tell process unityProc
+            set frontmost to true
+            delay 0.3
+            -- Raise window if available
+            try
+                if (count of windows) > 0 then
                     perform action "AXRaise" of window 1
                 end if
-            end tell
+            end try
+        end tell
+
+        -- Verify it became frontmost
+        delay 0.2
+        set frontProc to name of first process whose frontmost is true
+        if frontProc contains "Unity" then
             return "SUCCESS"
         else
-            return "NOTFOUND"
+            return "RETRY"
         end if
     end tell
     '''
-    
-    # Try simple method first
+
+    # Retry method: Use open command with bundle identifier
+    script_open_bundle = '''
+    do shell script "open -b com.unity3d.UnityEditor5.x 2>/dev/null || open -b com.unity3d.UnityEditor 2>/dev/null"
+    delay 0.5
+    tell application "System Events"
+        set frontProc to name of first process whose frontmost is true
+        if frontProc contains "Unity" then
+            return "SUCCESS"
+        else
+            return "FAILED"
+        end if
+    end tell
+    '''
+
+    # Attempt 1: System Events process search
     try:
         result = subprocess.run(
-            ['osascript', '-e', script_simple],
+            ['osascript', '-e', script_focus],
             capture_output=True,
             text=True,
-            timeout=5
+            timeout=10
         )
-        if result.returncode == 0:
-            return True
-    except FileNotFoundError:
-        print("osascript not found. This feature requires macOS.")
-        return False
-    except subprocess.TimeoutExpired:
-        pass  # Try robust method
-    except Exception:
-        pass  # Try robust method
-    
-    # Try robust method if simple failed
-    try:
-        result = subprocess.run(
-            ['osascript', '-e', script_robust],
-            capture_output=True,
-            text=True,
-            timeout=5
-        )
-        
+
         output = result.stdout.strip()
-        
+
         if "SUCCESS" in output:
             return True
         elif "NOTFOUND" in output:
-            print("Unity Editor not found. Is it running?")
+            print("Unity Editor process not found. Is it running?")
             return False
-        else:
-            return result.returncode == 0
-            
-    except Exception as e:
-        print(f"Error focusing Unity on macOS: {e}")
+        # If RETRY or other, try next method
+
+    except subprocess.TimeoutExpired:
+        print("Focus attempt timed out, retrying...")
+    except FileNotFoundError:
+        print("osascript not found. This feature requires macOS.")
         return False
+    except Exception as e:
+        print(f"Focus attempt 1 failed: {e}")
+
+    # Attempt 2: Open by bundle identifier
+    try:
+        result = subprocess.run(
+            ['osascript', '-e', script_open_bundle],
+            capture_output=True,
+            text=True,
+            timeout=10
+        )
+
+        output = result.stdout.strip()
+        if "SUCCESS" in output:
+            return True
+
+    except Exception as e:
+        print(f"Focus attempt 2 failed: {e}")
+
+    # Attempt 3: Direct activation by name variants
+    for app_name in ["Unity", "Unity Editor"]:
+        try:
+            script = f'tell application "{app_name}" to activate'
+            result = subprocess.run(
+                ['osascript', '-e', script],
+                capture_output=True,
+                text=True,
+                timeout=5
+            )
+            if result.returncode == 0:
+                time.sleep(0.3)
+                # Verify
+                verify = subprocess.run(
+                    ['osascript', '-e',
+                     'tell application "System Events" to return name of first process whose frontmost is true'],
+                    capture_output=True, text=True, timeout=3
+                )
+                if "Unity" in verify.stdout:
+                    return True
+        except Exception:
+            continue
+
+    print("Could not focus Unity Editor after all attempts")
+    return False
 
 def focus_unity():
     """

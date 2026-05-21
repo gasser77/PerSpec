@@ -5,6 +5,28 @@ All notable changes to the PerSpec Testing Framework will be documented in this 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added — Unity Helper toolbox expansion
+- **16 new scene actions** in `SceneTaskExecutor` (43 total): `WrapWithParent`, `AddComponentToMatching`, `Validate`, `BatchSetProperty`, `ApplyRecipe`, `SetActive`, `SetSiblingIndex`, `DuplicateGameObject`, `MoveGameObject`, `RemoveComponent`, `GetProperty`, `FindObjects`, `SetPropertyOnMatching`, `ClosePrefab`, `RemoveMissingScripts`, `ReportMissingScripts`. Switch dispatch retains both `SetParent` and `SetParentByTransform`.
+- **`FindInActiveContext`** scene+prefab-aware lookup replacing 50× call sites that used bare `GameObject.Find`. Actions now work uniformly inside the active scene and inside Prefab Mode.
+- **List-property variants** (`SetListPropertyOnPrefab` / `OnSceneFile` / `OnGameObject` / `OnScriptableObject`) for cleaner dispatch and prefab-stage tracking.
+- **JSON Schemas** in `Editor/Schemas/` (`scenario.schema.json`, `recipe.schema.json`, `validator-rules.schema.json`) for editor autocomplete and pre-execution validation.
+- **`unityhelper_coordinator.py`** runs Draft-07 schema validation against `scenario.schema.json` before submission. Falls back gracefully if `jsonschema` is not installed; bypassable with `--skip-schema-validation`.
+- **`TmproTaskExecutor`** with 4 TextMeshPro-specific actions, and **`Runtime/Localization/ArabicShaper.cs`** for Arabic text shaping.
+- **Async-task plumbing**: `TaskExecutorRegistry.IsAsyncTask(task)` exposed for non-UI coordinators; `ScenarioExecutorCoordinator` drives execution via a per-frame state machine that honors async tasks.
+- **`LocalizationTaskExecutor`** expanded with additional actions.
+
+### Added — Missing-script handling on prefabs
+- **`OpenPrefab`** now scans the opened stage for GameObjects with missing `MonoBehaviour` script slots. Detection uses `GameObjectUtility.GetMonoBehavioursWithMissingScriptCount` plus `AssetDatabase.GetDependencies` + `MonoScript.GetClass()` for class-load failures (no `.prefab` text parsing). When found, the task **succeeds with a `WARNING:`-prefixed `task.result`** and a `Debug.LogWarning` listing affected GameObject paths and the resolvable broken-script paths.
+- **`SavePrefab`** runs the same scan as a pre-flight; if missing slots exist, the task **fails** with an actionable error listing affected paths and broken script references, replacing Unity's opaque generic save error.
+- **`RemoveMissingScripts`** new action — strips missing-script slots from the open prefab (or a scoped sub-target via `target` param) so `SavePrefab` can succeed afterward. Uses `GameObjectUtility.RemoveMonoBehavioursWithMissingScript`.
+- **`ReportMissingScripts`** new diagnostic action — reports missing-script GameObjects + resolvable dependency GUIDs for a prefab via Unity APIs only (`PrefabUtility.LoadPrefabContents`, `EditorJsonUtility.ToJson`, `AssetDatabase`). Documents that orphan GUIDs (where both `.cs` and `.meta` were deleted) are not retrievable through Unity APIs and require git history (`git log --all --diff-filter=D`).
+
+### Documentation
+- `Documentation/unity-helper-tasks.md` (1219 lines): documented every dispatched scene action — 43 scene + 17 localization sections, plus the `Validate hasComponent` extension.
+- `Documentation/LLM.md`: added "Unity Helper — Augmented Toolbox" section with explicit pre-flight instructions for AI agents to load the action catalogue and JSON Schemas before authoring scenarios/recipes/validator-rules.
+
 ## [1.6.1] - 2026-05-13
 
 ### Documentation

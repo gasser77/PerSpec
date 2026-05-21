@@ -43,6 +43,7 @@ namespace PerSpec.UnityHelper.Editor
 #if HAS_UNITY_LOCALIZATION
             TaskExecutorRegistry.Register(new LocalizationTaskExecutor());
 #endif
+            TaskExecutorRegistry.Register(new TmproTaskExecutor());
         }
 
         private void OnFocus()

@@ -1,0 +1,81 @@
+{
+    "$schema": "http://json-schema.org/draft-07/schema#",
+    "$id": "https://perspec.digitraver.com/schemas/validator-rules.schema.json",
+    "title": "PerSpec Validator Rules File",
+    "description": "Project-authored invariant rules consumed by the Validate action. Generic: the validator knows nothing about specific packages — target and assert expressions reference component types by fully-qualified name.",
+    "type": "object",
+    "required": ["rules"],
+    "additionalProperties": true,
+    "properties": {
+        "description": { "type": "string" },
+        "rules": {
+            "type": "array",
+            "items": { "$ref": "#/definitions/Rule" }
+        }
+    },
+    "definitions": {
+        "Rule": {
+            "type": "object",
+            "required": ["name", "target", "assert"],
+            "additionalProperties": false,
+            "properties": {
+                "name": {
+                    "type": "string",
+                    "description": "Human-readable rule identifier, used in violation reports."
+                },
+                "target": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "properties": {
+                        "root": {
+                            "type": "string",
+                            "description": "Starting GameObject path. Empty or '/' = scene root."
+                        },
+                        "pathFilter": {
+                            "type": "string",
+                            "description": "Substring that the GameObject path must contain."
+                        },
+                        "hasComponent": {
+                            "type": "string",
+                            "description": "Fully-qualified component type name (e.g. 'TMPro.TextMeshProUGUI, Unity.TextMeshPro'). Only GameObjects with this component are included."
+                        },
+                        "maxDepth": {
+                            "type": "integer",
+                            "default": -1,
+                            "description": "-1 unlimited, 0 starting-point only, N = N levels below root."
+                        }
+                    }
+                },
+                "assert": { "$ref": "#/definitions/Assertion" }
+            }
+        },
+        "Assertion": {
+            "description": "Leaf assertion (component/field/comparator) or composition (not/all/any).",
+            "type": "object",
+            "properties": {
+                "component": { "type": "string", "description": "Fully-qualified component type name." },
+                "field": { "type": "string", "description": "Field or property name on the component." },
+                "equals": { "type": "string" },
+                "notEquals": { "type": "string" },
+                "isNull": { "type": "string", "enum": ["true", "false"] },
+                "in": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description": "Value must equal at least one of the listed strings."
+                },
+                "regex": { "type": "string", "description": "Regex pattern the value must match." },
+                "not": { "$ref": "#/definitions/Assertion", "description": "Negates the wrapped assertion." },
+                "all": {
+                    "type": "array",
+                    "items": { "$ref": "#/definitions/Assertion" },
+                    "description": "AND: every child assertion must pass."
+                },
+                "any": {
+                    "type": "array",
+                    "items": { "$ref": "#/definitions/Assertion" },
+                    "description": "OR: at least one child assertion must pass."
+                }
+            }
+        }
+    }
+}
