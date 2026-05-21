@@ -62,9 +62,14 @@
                         "DeleteGameObject", "AddToBuildSettings", "RenameGameObject", "CreateScriptableObject",
                         "SaveAsPrefab", "ExportHierarchy", "ExportHierarchyPrefab", "ExportHierarchyScene",
                         "InspectGameObject", "SetListProperty", "TakeScreenshot", "WaitForGameObject",
-                        "CallMethod", "SetParent", "SetActive", "SetSiblingIndex",
+                        "CallMethod", "SetParent", "SetParentByTransform", "SetActive", "SetSiblingIndex",
                         "DuplicateGameObject", "MoveGameObject", "RemoveComponent", "BatchSetProperty",
-                        "GetProperty", "FindObjects", "ApplyRecipe", "SetPropertyOnMatching", "Validate"
+                        "GetProperty", "FindObjects", "ApplyRecipe", "SetPropertyOnMatching", "Validate",
+                        "WrapWithParent", "AddComponentToMatching",
+                        "OpenPrefab", "SavePrefab", "ClosePrefab",
+                        "RemoveMissingScripts", "ReportMissingScripts",
+                        "SetImporterProperty",
+                        "GetPlayerPref", "SetPlayerPref", "DeletePlayerPref"
                     ]
                 },
                 "parameters": {

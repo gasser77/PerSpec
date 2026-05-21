@@ -56,6 +56,8 @@ namespace PerSpec.UnityHelper.Editor
                         return ImportTableFromCSV(task);
                     case "UpdateAll":
                         return UpdateAllLocalizations(task);
+                    case "RemoveOrphanKeys":
+                        return RemoveOrphanKeys(task);
                     default:
                         task.error = $"Unknown localization action: {task.action}";
                         return false;
@@ -934,6 +936,118 @@ namespace PerSpec.UnityHelper.Editor
             }
         }
 
+        /// <summary>
+        /// Removes corrupt/orphan entries from a String Table Collection that desync
+        /// SharedTableData and the per-locale tables. Two orphan classes:
+        ///  (a) SharedTableData entries whose Key name is null/empty — these make
+        ///      StringTableEntry.Key return null, so GetEntry(null) throws
+        ///      ArgumentNullException("key") and aborts ValidateKeys / UpdateAll and
+        ///      can break the runtime StringDatabase load (every key resolves to
+        ///      "[key]"). This is the bug LocalizationRules.md §11 warns about.
+        ///  (b) per-locale table rows whose KeyId has no SharedTableData entry.
+        /// Pass dryRun="true" to report without modifying. Idempotent.
+        /// </summary>
+        private bool RemoveOrphanKeys(Task task)
+        {
+            string tableName = GetOptionalParam(task, "table", "General");
+            bool dryRun = GetOptionalParam(task, "dryRun", "false") == "true";
+
+            try
+            {
+                var settings = LocalizationEditorSettings.ActiveLocalizationSettings;
+                if (settings == null)
+                {
+                    task.error = "RemoveOrphanKeys failed: LocalizationSettings not found.";
+                    return false;
+                }
+
+                var collection = LocalizationEditorSettings.GetStringTableCollection(tableName);
+                if (collection == null)
+                {
+                    task.error = $"RemoveOrphanKeys failed: String table '{tableName}' not found.";
+                    return false;
+                }
+
+                var shared = collection.SharedData;
+                if (shared == null)
+                {
+                    task.error = $"RemoveOrphanKeys failed: SharedData null for '{tableName}'.";
+                    return false;
+                }
+
+                var locales = LocalizationEditorSettings.GetLocales();
+
+                // (a) SharedData entries with null/empty key name.
+                var emptyNameIds = shared.Entries
+                    .Where(e => string.IsNullOrEmpty(e.Key))
+                    .Select(e => e.Id)
+                    .Distinct()
+                    .ToList();
+
+                // (b) per-locale table rows whose KeyId is absent / empty in SharedData.
+                var danglingByLocale = new List<string>();
+                var danglingIds = new HashSet<long>();
+                var sampleValues = new List<string>();
+                foreach (var locale in locales)
+                {
+                    var table = collection.GetTable(locale.Identifier) as UnityEngine.Localization.Tables.StringTable;
+                    if (table == null) continue;
+                    foreach (var entry in table.Values.ToList())
+                    {
+                        if (string.IsNullOrEmpty(shared.GetKey(entry.KeyId)))
+                        {
+                            danglingIds.Add(entry.KeyId);
+                            danglingByLocale.Add($"{locale.Identifier.Code}:{entry.KeyId}");
+                            if (locale.Identifier.Code == "en")
+                            {
+                                var v = entry.Value ?? "";
+                                sampleValues.Add($"{entry.KeyId}=\"{(v.Length > 40 ? v.Substring(0, 40) : v)}\"");
+                            }
+                        }
+                    }
+                }
+                Debug.LogWarning($"[LocalizationTaskExecutor] RemoveOrphanKeys dangling en values: {string.Join(" | ", sampleValues)}");
+
+                var allIds = new HashSet<long>(emptyNameIds);
+                foreach (var id in danglingIds) allIds.Add(id);
+
+                string summary = $"table='{tableName}' emptyNameSharedIds=[{string.Join(",", emptyNameIds)}] " +
+                                  $"danglingTableRows=[{string.Join(",", danglingByLocale)}] total={allIds.Count}";
+                Debug.LogWarning($"[LocalizationTaskExecutor] RemoveOrphanKeys ({(dryRun ? "DRY-RUN" : "APPLY")}): {summary}");
+
+                if (dryRun || allIds.Count == 0)
+                {
+                    task.result = (allIds.Count == 0 ? "No orphans found. " : "") + summary;
+                    return true;
+                }
+
+                foreach (var id in allIds)
+                {
+                    foreach (var locale in locales)
+                    {
+                        var table = collection.GetTable(locale.Identifier) as UnityEngine.Localization.Tables.StringTable;
+                        if (table == null) continue;
+                        table.Remove(id);
+                        EditorUtility.SetDirty(table);
+                    }
+                    shared.RemoveKey(id);
+                }
+
+                EditorUtility.SetDirty(shared);
+                EditorUtility.SetDirty(collection);
+                AssetDatabase.SaveAssets();
+                AssetDatabase.Refresh();
+
+                task.result = $"Removed {allIds.Count} orphan(s). {summary}";
+                return true;
+            }
+            catch (Exception ex)
+            {
+                task.error = $"RemoveOrphanKeys failed for '{tableName}': {ex.Message}";
+                return false;
+            }
+        }
+
         private bool GetString(Task task)
         {
             string key = GetParam(task, "key");
@@ -1171,6 +1285,20 @@ namespace PerSpec.UnityHelper.Editor
                 Debug.Log($"[LocalizationTaskExecutor] === Validation Report for table '{tableName}' ===");
                 Debug.Log($"Source language: {sourceLanguage}, Total keys: {sourceTable.Count}");
 
+                // Robustness guard: a SharedTableData<->table desync can leave entries whose
+                // resolved Key name is null/empty (orphan). StringTable.GetEntry(null) throws
+                // ArgumentNullException("key") and aborts the whole validation. Detect and
+                // report orphans once instead of crashing (LocalizationRules.md §11 — desync
+                // surfacing). KeyId is logged so the bad entry can be removed.
+                var orphanKeyIds = new List<long>();
+                foreach (var sourceEntry in sourceTable.Values)
+                {
+                    if (string.IsNullOrEmpty(sourceEntry.Key))
+                        orphanKeyIds.Add(sourceEntry.KeyId);
+                }
+                if (orphanKeyIds.Count > 0)
+                    Debug.LogWarning($"[LocalizationTaskExecutor] ORPHAN: {orphanKeyIds.Count} '{tableName}' source entr{(orphanKeyIds.Count == 1 ? "y has" : "ies have")} a null/empty SharedData key name. KeyIds: {string.Join(", ", orphanKeyIds)}");
+
                 var projectLocalesForValidation = LocalizationEditorSettings.GetLocales();
                 foreach (var targetLocale in projectLocalesForValidation)
                 {
@@ -1186,6 +1314,8 @@ namespace PerSpec.UnityHelper.Editor
 
                     foreach (var sourceEntry in sourceTable.Values)
                     {
+                        if (string.IsNullOrEmpty(sourceEntry.Key))
+                            continue; // orphan — reported once above; GetEntry(null) would throw
                         var targetEntry = targetTable.GetEntry(sourceEntry.Key);
                         if (targetEntry == null)
                             missingKeys.Add(sourceEntry.Key);

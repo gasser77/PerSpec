@@ -112,6 +112,14 @@ namespace PerSpec.UnityHelper.Editor
                         return WrapWithParent(task);
                     case "AddComponentToMatching":
                         return AddComponentToMatching(task);
+                    case "SetImporterProperty":
+                        return SetImporterProperty(task);
+                    case "GetPlayerPref":
+                        return GetPlayerPref(task);
+                    case "SetPlayerPref":
+                        return SetPlayerPref(task);
+                    case "DeletePlayerPref":
+                        return DeletePlayerPref(task);
                     default:
                         task.error = $"Unknown action: {task.action}";
                         return false;
@@ -3587,9 +3595,47 @@ namespace PerSpec.UnityHelper.Editor
         /// </summary>
         private bool GetProperty(Task task)
         {
-            string path = GetParam(task, "path");
-            string componentName = GetParam(task, "component");
+            string ownerPath = GetOptionalParam(task, "owner");
+            string path = GetOptionalParam(task, "path");
+            string componentName = GetOptionalParam(task, "component");
             string fieldName = GetParam(task, "field");
+
+            if (string.IsNullOrEmpty(fieldName))
+            {
+                task.error = "GetProperty requires 'field' parameter";
+                return false;
+            }
+
+            const System.Reflection.BindingFlags flags =
+                System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.NonPublic |
+                System.Reflection.BindingFlags.Instance;
+
+            // ScriptableObject asset: owner=*.asset, no path/component.
+            if (!string.IsNullOrEmpty(ownerPath) && ownerPath.EndsWith(".asset") &&
+                string.IsNullOrEmpty(path) && string.IsNullOrEmpty(componentName))
+            {
+                var so = AssetDatabase.LoadAssetAtPath<ScriptableObject>(ownerPath);
+                if (so == null)
+                {
+                    task.error = $"ScriptableObject not found: {ownerPath}";
+                    return false;
+                }
+                if (!TryReadMember(so.GetType(), so, fieldName, flags, out object soVal, out string soType, out string soErr))
+                {
+                    task.error = soErr;
+                    return false;
+                }
+                task.result = SerializeReflectedValue(soType, soVal);
+                Debug.Log($"[SceneTaskExecutor] GetProperty (SO) {ownerPath}.{fieldName} → {soType} ✓");
+                return true;
+            }
+
+            // Scene GameObject (legacy / current behavior): path + component + field.
+            if (string.IsNullOrEmpty(path) || string.IsNullOrEmpty(componentName))
+            {
+                task.error = "GetProperty requires either 'path'+'component' (scene GO) or 'owner' (ScriptableObject asset path)";
+                return false;
+            }
 
             var go = FindInActiveContext(path);
             if (go == null)
@@ -3612,37 +3658,42 @@ namespace PerSpec.UnityHelper.Editor
                 return false;
             }
 
-            const System.Reflection.BindingFlags flags =
-                System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.NonPublic |
-                System.Reflection.BindingFlags.Instance;
-
-            object value;
-            string resolvedTypeName;
-            var field = type.GetField(fieldName, flags);
-            if (field != null)
+            if (!TryReadMember(type, component, fieldName, flags, out object value, out string resolvedTypeName, out string err))
             {
-                value = field.GetValue(component);
-                resolvedTypeName = field.FieldType.Name;
-            }
-            else
-            {
-                var prop = type.GetProperty(fieldName, flags);
-                if (prop == null || !prop.CanRead)
-                {
-                    task.error = $"Field or readable property '{fieldName}' not found on {componentName}";
-                    return false;
-                }
-                if (prop.GetIndexParameters().Length > 0)
-                {
-                    task.error = $"Indexed property '{fieldName}' cannot be read via GetProperty";
-                    return false;
-                }
-                value = prop.GetValue(component);
-                resolvedTypeName = prop.PropertyType.Name;
+                task.error = err;
+                return false;
             }
 
             task.result = SerializeReflectedValue(resolvedTypeName, value);
             Debug.Log($"[SceneTaskExecutor] GetProperty {path}/{componentName}.{fieldName} → {resolvedTypeName} ✓");
+            return true;
+        }
+
+        // Shared field/property reader used by GetProperty for both scene components and SO assets.
+        private static bool TryReadMember(System.Type type, object target, string fieldName,
+            System.Reflection.BindingFlags flags, out object value, out string resolvedTypeName, out string error)
+        {
+            value = null; resolvedTypeName = null; error = null;
+            var field = type.GetField(fieldName, flags);
+            if (field != null)
+            {
+                value = field.GetValue(target);
+                resolvedTypeName = field.FieldType.Name;
+                return true;
+            }
+            var prop = type.GetProperty(fieldName, flags);
+            if (prop == null || !prop.CanRead)
+            {
+                error = $"Field or readable property '{fieldName}' not found on {type.Name}";
+                return false;
+            }
+            if (prop.GetIndexParameters().Length > 0)
+            {
+                error = $"Indexed property '{fieldName}' cannot be read via GetProperty";
+                return false;
+            }
+            value = prop.GetValue(target);
+            resolvedTypeName = prop.PropertyType.Name;
             return true;
         }
 
@@ -4425,6 +4476,202 @@ namespace PerSpec.UnityHelper.Editor
 
             detail = "leaf assertion has no comparator (equals/notEquals/isNull/in/regex)";
             return false;
+        }
+
+        // SetImporterProperty: set a field or property on an AssetImporter (TextureImporter,
+        // ModelImporter, AudioImporter, etc.) and trigger SaveAndReimport() to persist + reapply.
+        // Generic via reflection — works on any AssetImporter subtype's public/non-public members.
+        // Use cases: change TextureImporter.spriteImportMode, TextureImporter.textureType,
+        // ModelImporter.importTangents, AudioImporter.forceToMono, etc., from a scenario JSON
+        // instead of writing a one-off editor script.
+        private bool SetImporterProperty(Task task)
+        {
+            string assetPath = GetParam(task, "assetPath");
+            string fieldName = GetParam(task, "field");
+            string valueStr = GetParam(task, "value");
+            string expectedImporterType = GetOptionalParam(task, "importerType");
+
+            if (string.IsNullOrEmpty(assetPath))
+            {
+                task.error = "SetImporterProperty requires 'assetPath' parameter";
+                return false;
+            }
+            if (string.IsNullOrEmpty(fieldName))
+            {
+                task.error = "SetImporterProperty requires 'field' parameter";
+                return false;
+            }
+            if (valueStr == null)
+            {
+                task.error = "SetImporterProperty requires 'value' parameter";
+                return false;
+            }
+
+            var importer = AssetImporter.GetAtPath(assetPath);
+            if (importer == null)
+            {
+                task.error = $"AssetImporter not found at: {assetPath}";
+                return false;
+            }
+
+            var importerType = importer.GetType();
+            if (!string.IsNullOrEmpty(expectedImporterType) && importerType.Name != expectedImporterType)
+            {
+                task.error = $"Expected importer type '{expectedImporterType}' but got '{importerType.Name}' at: {assetPath}";
+                return false;
+            }
+
+            var prop = importerType.GetProperty(fieldName,
+                BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+            var field = importerType.GetField(fieldName,
+                BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+
+            try
+            {
+                if (prop != null && prop.CanWrite)
+                {
+                    object value = ConvertValue(prop.PropertyType, valueStr);
+                    prop.SetValue(importer, value);
+                }
+                else if (field != null)
+                {
+                    object value = ConvertValue(field.FieldType, valueStr);
+                    field.SetValue(importer, value);
+                }
+                else
+                {
+                    task.error = $"Field or property '{fieldName}' not found on {importerType.Name}";
+                    return false;
+                }
+            }
+            catch (Exception ex)
+            {
+                task.error = $"Failed to set {importerType.Name}.{fieldName} = {valueStr}: {ex.Message}";
+                return false;
+            }
+
+            importer.SaveAndReimport();
+            Debug.Log($"[SceneTaskExecutor] SetImporterProperty: {assetPath} / {importerType.Name}.{fieldName} = {valueStr} ✓");
+            return true;
+        }
+
+        // GetPlayerPref: read a key from PlayerPrefs and return its value in task.result.
+        // PlayerPrefs only stores three types — string, int, float. The 'type' parameter
+        // disambiguates; defaults to "string" since that covers the common case (locale codes,
+        // user IDs, saved usernames). Result is JSON for consistency with GetProperty.
+        private bool GetPlayerPref(Task task)
+        {
+            string key = GetParam(task, "key");
+            string type = (GetOptionalParam(task, "type") ?? "string").ToLowerInvariant();
+
+            if (string.IsNullOrEmpty(key))
+            {
+                task.error = "GetPlayerPref requires 'key' parameter";
+                return false;
+            }
+
+            if (!PlayerPrefs.HasKey(key))
+            {
+                task.result = "{\"hasKey\":false,\"key\":\"" + key + "\"}";
+                Debug.Log($"[SceneTaskExecutor] GetPlayerPref: key '{key}' not set");
+                return true;
+            }
+
+            string valueRepr;
+            switch (type)
+            {
+                case "int":
+                    valueRepr = PlayerPrefs.GetInt(key).ToString();
+                    break;
+                case "float":
+                    valueRepr = PlayerPrefs.GetFloat(key).ToString(System.Globalization.CultureInfo.InvariantCulture);
+                    break;
+                case "string":
+                default:
+                    string s = PlayerPrefs.GetString(key);
+                    valueRepr = "\"" + s.Replace("\\", "\\\\").Replace("\"", "\\\"") + "\"";
+                    break;
+            }
+            task.result = "{\"hasKey\":true,\"key\":\"" + key + "\",\"type\":\"" + type + "\",\"value\":" + valueRepr + "}";
+            Debug.Log($"[SceneTaskExecutor] GetPlayerPref: {key} = {valueRepr} ({type})");
+            return true;
+        }
+
+        // SetPlayerPref: write a key into PlayerPrefs. Always calls PlayerPrefs.Save() so the
+        // change persists immediately (matters in the Editor where Save() isn't automatic).
+        private bool SetPlayerPref(Task task)
+        {
+            string key = GetParam(task, "key");
+            string valueStr = GetParam(task, "value");
+            string type = (GetOptionalParam(task, "type") ?? "string").ToLowerInvariant();
+
+            if (string.IsNullOrEmpty(key))
+            {
+                task.error = "SetPlayerPref requires 'key' parameter";
+                return false;
+            }
+            if (valueStr == null)
+            {
+                task.error = "SetPlayerPref requires 'value' parameter";
+                return false;
+            }
+
+            try
+            {
+                switch (type)
+                {
+                    case "int":
+                        PlayerPrefs.SetInt(key, int.Parse(valueStr));
+                        break;
+                    case "float":
+                        PlayerPrefs.SetFloat(key, float.Parse(valueStr, System.Globalization.CultureInfo.InvariantCulture));
+                        break;
+                    case "string":
+                    default:
+                        PlayerPrefs.SetString(key, valueStr);
+                        break;
+                }
+                PlayerPrefs.Save();
+            }
+            catch (Exception ex)
+            {
+                task.error = $"Failed to parse '{valueStr}' as {type}: {ex.Message}";
+                return false;
+            }
+
+            Debug.Log($"[SceneTaskExecutor] SetPlayerPref: {key} = {valueStr} ({type}) ✓");
+            return true;
+        }
+
+        // DeletePlayerPref: remove a key from PlayerPrefs (or all keys when key="*"). Idempotent.
+        private bool DeletePlayerPref(Task task)
+        {
+            string key = GetParam(task, "key");
+            if (string.IsNullOrEmpty(key))
+            {
+                task.error = "DeletePlayerPref requires 'key' parameter (use '*' to clear all)";
+                return false;
+            }
+
+            if (key == "*")
+            {
+                PlayerPrefs.DeleteAll();
+                PlayerPrefs.Save();
+                Debug.Log("[SceneTaskExecutor] DeletePlayerPref: all keys cleared ✓");
+                return true;
+            }
+
+            if (PlayerPrefs.HasKey(key))
+            {
+                PlayerPrefs.DeleteKey(key);
+                PlayerPrefs.Save();
+                Debug.Log($"[SceneTaskExecutor] DeletePlayerPref: {key} ✓");
+            }
+            else
+            {
+                Debug.Log($"[SceneTaskExecutor] DeletePlayerPref: {key} not set, no-op");
+            }
+            return true;
         }
     }
 }

@@ -293,7 +293,7 @@ Saves a GameObject from the current scene as a prefab asset.
 - Idempotent: Replaces existing prefab if it already exists
 
 ### SetListProperty
-Sets a list property on a ScriptableObject with multiple asset references.
+Sets a serialized `List<T>` field on any target: a ScriptableObject (`owner=*.asset`), a Prefab MonoBehaviour (`owner=*.prefab` + `path` + `component`), a scene-file MonoBehaviour (`owner=*.unity` + `path` + `component`), or an active-scene MonoBehaviour (`path` + `component`, no `owner`). Element types include primitives, strings, enums (parsed by enum-name), `Vector2/3/4`, `Color`, plus any `UnityEngine.Object` asset reference. Complex serialized structs use the `json` parameter (ScriptableObject targets only).
 
 **Simple lists (pipe-separated values):**
 ```json
@@ -602,6 +602,28 @@ Quality assurance tool - checks which translations are missing or empty.
 - `sourceLanguage` - Source language to compare against (optional, defaults to "en")
 - `table` - Table name (optional, defaults to "General")
 - Logs comprehensive validation report to Unity Console
+
+### RemoveOrphanKeys
+Repairs a SharedData↔table desync in a String Table Collection. Removes rows whose
+`KeyId` has no SharedData key name (also any SharedData entry with a null/empty key).
+Such rows are unreachable via `GetString` (no key name to look them up), crash
+`ValidateKeys` / `UpdateAll` with `ArgumentNullException: key`, and corrupt the runtime
+`StringDatabase` load so **every** key in the table resolves to `[key]`.
+```json
+{
+    "type": "localization",
+    "action": "RemoveOrphanKeys",
+    "parameters": [
+        {"key": "table", "value": "General"},
+        {"key": "dryRun", "value": "true"}
+    ]
+}
+```
+- `table` - Table collection name (optional, defaults to "General")
+- `dryRun` - `"true"` reports orphan KeyIds (and en values) without modifying; `"false"` (default) removes them
+- Idempotent. Run `dryRun` first. Symptoms that call for it: `ValidateKeys`/`UpdateAll`
+  throw `Value cannot be null. Parameter name: key`, or the running game shows
+  `[some.key]` for keys that resolve fine in the editor.
 
 ### RenameKey
 Safely renames a key across all languages.
@@ -1116,7 +1138,9 @@ Sets multiple fields/properties on a single component in one task. Saves dispatc
 - `properties` (required): JSON object mapping field/property name → value (each value parsed the same way `SetProperty` parses).
 
 ### GetProperty
-Reads a field or readable property and returns the serialized value in `task.result`. Counterpart to `SetProperty`.
+Reads a field or readable property and returns the serialized value in `task.result`. Counterpart to `SetProperty`. Two forms:
+
+**Scene GameObject (path + component + field):**
 ```json
 {
     "action": "GetProperty",
@@ -1127,7 +1151,18 @@ Reads a field or readable property and returns the serialized value in `task.res
     ]
 }
 ```
-- `path`, `component`, `field` (required).
+
+**ScriptableObject asset (owner=*.asset + field):**
+```json
+{
+    "action": "GetProperty",
+    "parameters": [
+        { "key": "owner", "value": "Assets/DataService/LocalizationService.asset" },
+        { "key": "field", "value": "currentLanguage" }
+    ]
+}
+```
+- `path`+`component`+`field` for scene GameObjects, OR `owner`+`field` for ScriptableObject assets.
 - Reads non-public members too. Indexed properties return an error — use specific field/getter instead.
 - Result is JSON-friendly via `SerializeReflectedValue` (primitives, `Vector*`, `Color`, references encoded as paths/asset-paths).
 
@@ -1200,6 +1235,67 @@ Runs project-authored invariant rules against the active scene/prefab. Each rule
 - `strict` (optional, default `"true"`): when `true`, any rule violation fails the task; when `false`, violations are reported in `task.result` but the task succeeds.
 - Result: per-rule summary (rule name, targets matched, violations) plus aggregate counts.
 - See the **Validate `hasComponent` leaf (extension)** section for the assertion grammar.
+
+### SetImporterProperty
+Sets a field or property on the **AssetImporter** for a given asset (TextureImporter, ModelImporter, AudioImporter, etc.) and calls `SaveAndReimport()` to persist and reapply. Generic reflection-based — works on any AssetImporter subtype's public or non-public members. Use this instead of writing one-off editor scripts to flip import settings.
+```json
+{
+    "action": "SetImporterProperty",
+    "parameters": [
+        { "key": "assetPath", "value": "Assets/ScreenTextures/welcomescreenbackground.png" },
+        { "key": "field", "value": "spriteImportMode" },
+        { "key": "value", "value": "Single" },
+        { "key": "importerType", "value": "TextureImporter" }
+    ]
+}
+```
+- `assetPath` (required): path to the asset (Unity-format, starts with `Assets/`).
+- `field` (required): the importer field or property name (e.g., `spriteImportMode`, `textureType`, `mipmapEnabled`, `wrapMode`, `filterMode`, `npotScale`, `isReadable`).
+- `value` (required): value as a string. Parsed via `ConvertValue` — same rules as `SetProperty`: enums by name (`"Single"`, `"Sprite"`, `"Bilinear"`), bools (`"true"`/`"false"`), numbers, vectors (`"x,y"`), colors (`"#FFAA00"` or `"red"`).
+- `importerType` (optional): expected importer subtype name (e.g., `"TextureImporter"`, `"ModelImporter"`, `"AudioImporter"`). When provided, the task fails fast if the asset's actual importer is a different type — guards against accidentally touching the wrong asset class.
+- Calls `SaveAndReimport()` on success → asset is reimported in the same task, downstream tasks see the new state.
+- **Common pairings:** to convert a PNG to a Single sprite, often you need two calls: first `field=textureType, value=Sprite`, then `field=spriteImportMode, value=Single`. Most TextureImporters created via drag-drop default to `Default` textureType, which makes sprite-related fields no-op.
+
+### GetPlayerPref
+Read a key from Unity's `PlayerPrefs`. Returns a JSON object in `task.result`: `{"hasKey":bool,"key":"...","type":"...","value":...}`. When `hasKey:false`, no `type`/`value` fields are present.
+```json
+{
+    "action": "GetPlayerPref",
+    "parameters": [
+        { "key": "key",  "value": "Undugu_Language" },
+        { "key": "type", "value": "string" }
+    ]
+}
+```
+- `key` (required): the PlayerPrefs key name.
+- `type` (optional, default `"string"`): `"string" | "int" | "float"` — PlayerPrefs only stores these three. Wrong type silently returns the platform default for that type.
+
+### SetPlayerPref
+Write a key to `PlayerPrefs` and `PlayerPrefs.Save()` immediately (important in the Editor where Save isn't automatic).
+```json
+{
+    "action": "SetPlayerPref",
+    "parameters": [
+        { "key": "key",   "value": "Undugu_Language" },
+        { "key": "value", "value": "en" },
+        { "key": "type",  "value": "string" }
+    ]
+}
+```
+- `key`, `value` (required).
+- `type` (optional, default `"string"`): same as `GetPlayerPref`. `value` is parsed accordingly.
+
+### DeletePlayerPref
+Remove a key (or all keys when `key="*"`) from `PlayerPrefs`. Idempotent.
+```json
+{
+    "action": "DeletePlayerPref",
+    "parameters": [
+        { "key": "key", "value": "Undugu_Language" }
+    ]
+}
+```
+- `key` (required): the PlayerPrefs key to delete; pass `"*"` to call `PlayerPrefs.DeleteAll()` (use with care).
 
 ## Common Mistakes to Avoid
 
