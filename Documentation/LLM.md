@@ -49,7 +49,7 @@ python Packages/com.digitraver.perspec/ScriptingTools/sync_python_scripts.py
 | "LLM setup"         | `python Packages/com.digitraver.perspec/ScriptingTools/sync_python_scripts.py`              |
 | "show/get errors"   | `python PerSpec/Coordination/Scripts/monitor_editmode_logs.py --errors`                     |
 | "run tests"         | `python PerSpec/Coordination/Scripts/quick_test.py all -p edit --wait`                      |
-| "refresh Unity"     | `python PerSpec/Coordination/Scripts/quick_refresh.py full --wait`                          |
+| "refresh Unity"     | `python PerSpec/Coordination/Scripts/quick_refresh.py full --focus --wait`                          |
 | "show logs"         | `python PerSpec/Coordination/Scripts/monitor_editmode_logs.py recent -n 50`                |
 | "export logs"       | `python PerSpec/Coordination/Scripts/monitor_editmode_logs.py sessions`                     |
 | "monitor logs live" | `python PerSpec/Coordination/Scripts/monitor_editmode_logs.py live`                         |
@@ -262,7 +262,7 @@ python PerSpec/Coordination/Scripts/db_update_status_constraint.py
 # Don't wait until test time - verify compilation RIGHT AFTER coding!
 
 # 2. ⚡ ALWAYS REFRESH UNITY FIRST! (DO NOT SKIP!)
-python PerSpec/Coordination/Scripts/quick_refresh.py full --wait
+python PerSpec/Coordination/Scripts/quick_refresh.py full --focus --wait
 # ❌ NEVER run tests without refreshing - Unity won't see your changes!
 # 📌 Run this IMMEDIATELY after writing/editing ANY C# code!
 
@@ -285,7 +285,7 @@ python PerSpec/Coordination/Scripts/quick_test.py all -p edit --wait
 
 ### 📋 Step-by-Step Checklist (USE THIS EVERY TIME!):
 ☐ Code written/modified
-☐ Unity refreshed (`quick_refresh.py full --wait`)
+☐ Unity refreshed (`quick_refresh.py full --focus --wait`)
 ☐ Compilation checked (`monitor_editmode_logs.py --errors`)
 ☐ No errors found (or all fixed)
 ☐ Tests executed (`quick_test.py`)
@@ -335,7 +335,7 @@ quick_test.py method Tests.PlayMode.SimplePerSpecTest.Should_Pass -p play --wait
 ```bash
 # MANDATORY AFTER ANY CODE CHANGE - DO NOT SKIP!
 # 1. Refresh Unity to pick up changes
-python PerSpec/Coordination/Scripts/quick_refresh.py full --wait
+python PerSpec/Coordination/Scripts/quick_refresh.py full --focus --wait
 
 # 2. Check for compilation errors
 python PerSpec/Coordination/Scripts/monitor_editmode_logs.py --errors
@@ -669,7 +669,7 @@ public class ExampleComponent : MonoBehaviour {
 ### Check DOTS Status
 ```bash
 # Check if DOTS is enabled (look for PERSPEC_DOTS_ENABLED in output)
-python PerSpec/Coordination/Scripts/quick_refresh.py full --wait
+python PerSpec/Coordination/Scripts/quick_refresh.py full --focus --wait
 # Then check Unity console or Control Center > Dashboard for "DOTS Support" status
 ```
 
@@ -823,7 +823,7 @@ python PerSpec/Coordination/Scripts/quick_menu.py cancel <request_id>
 ## 📊 Quick Reference
 
 ### 🔴 STOP! Before Running ANY Test:
-1. Did you refresh Unity? → If no, run `quick_refresh.py full --wait`
+1. Did you refresh Unity? → If no, run `quick_refresh.py full --focus --wait`
 2. Did you check for errors? → If no, run `monitor_editmode_logs.py --errors`
 3. Are there compilation errors? → If yes, FIX THEM FIRST
 4. Only NOW can you run tests → `quick_test.py all -p edit --wait`
@@ -831,7 +831,7 @@ python PerSpec/Coordination/Scripts/quick_menu.py cancel <request_id>
 ### Compilation Error Handling
 | Situation | Action | Command |
 |-----------|--------|---------|
-| **BEFORE ANY TEST** | **ALWAYS refresh Unity** | `quick_refresh.py full --wait` |
+| **BEFORE ANY TEST** | **ALWAYS refresh Unity** | `quick_refresh.py full --focus --wait` |
 | **After EVERY refresh** | **ALWAYS check errors** | `monitor_editmode_logs.py --errors` |
 | Errors found | FIX before testing | Do NOT run tests |
 | Tests show "inconclusive" | Check compilation | `monitor_editmode_logs.py --errors` |

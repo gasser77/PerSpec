@@ -540,13 +540,18 @@ namespace PerSpec.Editor.Services
                 startMarker = "# PERSPEC_CONFIG_START";
                 endMarker = "# PERSPEC_CONFIG_END";
             }
-            
+
+            // LLM.md ships wrapped in its own markers; strip them so the block
+            // is wrapped exactly once (otherwise end markers accumulate per sync)
+            llmContent = StripConfigMarkers(llmContent);
+
             // Check if content already has PerSpec block
             if (existingContent.Contains(startMarker) && existingContent.Contains(endMarker))
             {
-                // Replace existing content between markers
+                // Replace existing content between markers; span to the LAST end
+                // marker so duplicates left by earlier versions are healed
                 int startIndex = existingContent.IndexOf(startMarker);
-                int endIndex = existingContent.IndexOf(endMarker) + endMarker.Length;
+                int endIndex = existingContent.LastIndexOf(endMarker) + endMarker.Length;
                 
                 if (startIndex != -1 && endIndex > startIndex)
                 {
@@ -567,9 +572,25 @@ namespace PerSpec.Editor.Services
             
             // Apply permission block based on EditorPrefs settings
             existingContent = LLMPermissionManager.UpdatePermissionBlock(existingContent, provider);
-            
+
             // Write back the updated content
             File.WriteAllText(configPath, existingContent);
+        }
+
+        private static string StripConfigMarkers(string content)
+        {
+            string[] markerLines =
+            {
+                "<!-- PERSPEC_CONFIG_START -->",
+                "<!-- PERSPEC_CONFIG_END -->",
+                "# PERSPEC_CONFIG_START",
+                "# PERSPEC_CONFIG_END"
+            };
+
+            var lines = content.Split('\n')
+                .Where(line => !markerLines.Contains(line.Trim()))
+                .ToArray();
+            return string.Join("\n", lines).Trim();
         }
         
         /// <summary>
