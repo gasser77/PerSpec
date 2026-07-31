@@ -114,12 +114,16 @@ namespace PerSpec.UnityHelper.Editor
                         return AddComponentToMatching(task);
                     case "SetImporterProperty":
                         return SetImporterProperty(task);
+                    case "SetPluginPlatform":
+                        return SetPluginPlatform(task);
                     case "GetPlayerPref":
                         return GetPlayerPref(task);
                     case "SetPlayerPref":
                         return SetPlayerPref(task);
                     case "DeletePlayerPref":
                         return DeletePlayerPref(task);
+                    case "ImportUnityPackage":
+                        return ImportUnityPackage(task);
                     default:
                         task.error = $"Unknown action: {task.action}";
                         return false;
@@ -281,6 +285,44 @@ namespace PerSpec.UnityHelper.Editor
             Debug.Log($"[SceneTaskExecutor]Loaded scene: {path}");
             return true;
         }
+        /// <summary>
+        /// Imports a .unitypackage into the project (non-interactive by default). Absolute
+        /// or project-relative path. Script-bearing packages trigger a recompile/domain
+        /// reload AFTER import — callers should follow the scenario with a quick_refresh +
+        /// compile-error check before relying on the imported types.
+        /// </summary>
+        private bool ImportUnityPackage(Task task)
+        {
+            string path = GetParam(task, "path");
+            bool interactive = GetOptionalParam(task, "interactive", "false").ToLowerInvariant() == "true";
+
+            if (!System.IO.File.Exists(path))
+            {
+                task.error = $"Package file not found: {path}";
+                return false;
+            }
+
+            AssetDatabase.importPackageCompleted += OnImportPackageCompleted;
+            AssetDatabase.importPackageFailed += OnImportPackageFailed;
+            AssetDatabase.ImportPackage(path, interactive);
+
+            task.result = $"Import requested: {System.IO.Path.GetFileName(path)}";
+            Debug.Log($"[SceneTaskExecutor]Importing unitypackage: {path} (interactive={interactive})");
+            return true;
+        }
+
+        private static void OnImportPackageCompleted(string packageName)
+        {
+            AssetDatabase.importPackageCompleted -= OnImportPackageCompleted;
+            Debug.Log($"[SceneTaskExecutor]✓ unitypackage import completed: {packageName}");
+        }
+
+        private static void OnImportPackageFailed(string packageName, string errorMessage)
+        {
+            AssetDatabase.importPackageFailed -= OnImportPackageFailed;
+            Debug.LogError($"[SceneTaskExecutor]✗ unitypackage import FAILED: {packageName} — {errorMessage}");
+        }
+
         private bool AddComponent(Task task)
         {
             string path = GetParam(task, "path");
@@ -671,8 +713,14 @@ namespace PerSpec.UnityHelper.Editor
                 return bool.Parse(valuePath);
             if (targetType == typeof(int))
                 return int.Parse(valuePath);
+            if (targetType == typeof(uint))
+                return uint.Parse(valuePath);
+            if (targetType == typeof(long))
+                return long.Parse(valuePath);
             if (targetType == typeof(float))
                 return float.Parse(valuePath);
+            if (targetType == typeof(double))
+                return double.Parse(valuePath);
             if (targetType == typeof(string))
                 return valuePath;
             if (targetType == typeof(Color))
@@ -4552,6 +4600,89 @@ namespace PerSpec.UnityHelper.Editor
 
             importer.SaveAndReimport();
             Debug.Log($"[SceneTaskExecutor] SetImporterProperty: {assetPath} / {importerType.Name}.{fieldName} = {valueStr} ✓");
+            return true;
+        }
+
+        // SetPluginPlatform: configure a native plugin's platform compatibility on its
+        // PluginImporter — enable/disable "Any Platform", the Editor, or a specific BuildTarget,
+        // plus optional per-platform data (e.g. CPU = AnyCPU). PluginImporter exposes these only
+        // through METHODS (SetCompatibleWithPlatform / SetCompatibleWithAnyPlatform /
+        // SetCompatibleWithEditor / SetPlatformData), which the reflection-on-members
+        // SetImporterProperty cannot reach — hence this dedicated Unity-native core primitive.
+        // Typical use: enable an Objective-C++ source plugin (.mm) for StandaloneOSX so its
+        // extern "C" symbols are compiled into the IL2CPP GameAssembly.
+        private bool SetPluginPlatform(Task task)
+        {
+            string assetPath = GetParam(task, "assetPath");
+            string platform = GetParam(task, "platform");
+            string enableStr = GetParam(task, "enable");
+            string dataKey = GetOptionalParam(task, "dataKey");
+            string dataValue = GetOptionalParam(task, "dataValue");
+
+            if (string.IsNullOrEmpty(assetPath))
+            {
+                task.error = "SetPluginPlatform requires 'assetPath' parameter";
+                return false;
+            }
+            if (string.IsNullOrEmpty(platform))
+            {
+                task.error = "SetPluginPlatform requires 'platform' parameter (\"AnyPlatform\", \"Editor\", or a BuildTarget name like \"StandaloneOSX\")";
+                return false;
+            }
+            if (string.IsNullOrEmpty(enableStr) || !bool.TryParse(enableStr, out bool enable))
+            {
+                task.error = "SetPluginPlatform requires 'enable' parameter (\"true\"/\"false\")";
+                return false;
+            }
+
+            var importer = AssetImporter.GetAtPath(assetPath) as PluginImporter;
+            if (importer == null)
+            {
+                task.error = $"PluginImporter not found at: {assetPath} (asset missing or not a plugin)";
+                return false;
+            }
+
+            try
+            {
+                if (platform.Equals("AnyPlatform", StringComparison.OrdinalIgnoreCase))
+                {
+                    importer.SetCompatibleWithAnyPlatform(enable);
+                }
+                else if (platform.Equals("Editor", StringComparison.OrdinalIgnoreCase))
+                {
+                    importer.SetCompatibleWithEditor(enable);
+                }
+                else if (Enum.TryParse(platform, ignoreCase: true, out BuildTarget target))
+                {
+                    importer.SetCompatibleWithPlatform(target, enable);
+                }
+                else
+                {
+                    task.error = $"Unknown platform '{platform}' — use \"AnyPlatform\", \"Editor\", or a BuildTarget name (e.g. \"StandaloneOSX\", \"iOS\", \"Android\")";
+                    return false;
+                }
+
+                if (!string.IsNullOrEmpty(dataKey))
+                {
+                    // Prefer the BuildTarget overload — the string overload expects Unity's
+                    // internal platform names ("OSXUniversal", not "StandaloneOSX") and
+                    // silently no-ops on mismatch.
+                    if (Enum.TryParse(platform, ignoreCase: true, out BuildTarget dataTarget))
+                        importer.SetPlatformData(dataTarget, dataKey, dataValue ?? string.Empty);
+                    else
+                        importer.SetPlatformData(platform, dataKey, dataValue ?? string.Empty);
+                }
+            }
+            catch (Exception ex)
+            {
+                task.error = $"SetPluginPlatform failed for {assetPath} ({platform}={enable}): {ex.Message}";
+                return false;
+            }
+
+            importer.SaveAndReimport();
+            string dataNote = string.IsNullOrEmpty(dataKey) ? "" : $", {dataKey}={dataValue}";
+            task.result = $"{platform}={enable}{dataNote}";
+            Debug.Log($"[SceneTaskExecutor] SetPluginPlatform: {assetPath} → {platform}={enable}{dataNote} ✓");
             return true;
         }
 

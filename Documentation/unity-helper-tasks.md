@@ -194,6 +194,9 @@ Note: For assets, `path` and `component` are NOT needed - only `owner`, `field`,
 }
 ```
 
+**Supported value coercions (string → target field type):**
+`bool`, `int`, `uint`, `long`, `float`, `double`, `string`, `Color` (hex/named/`r,g,b,a`), `Vector2/3/4`, `Vector2Int`, enums (incl. `TMPro.TextAlignmentOptions` shorthand), `Sprite` (asset path), and any `UnityEngine.Object` subclass (scene path → component, otherwise asset path). Integer-sized primitives `uint`/`long`/`double` were added 2026-05-28 to support Flexalon grid fields (`_columns`/`_rows` are `uint`) and similar integral-typed serialized fields.
+
 ### SetTransform
 ```json
 {
@@ -1256,6 +1259,27 @@ Sets a field or property on the **AssetImporter** for a given asset (TextureImpo
 - Calls `SaveAndReimport()` on success → asset is reimported in the same task, downstream tasks see the new state.
 - **Common pairings:** to convert a PNG to a Single sprite, often you need two calls: first `field=textureType, value=Sprite`, then `field=spriteImportMode, value=Single`. Most TextureImporters created via drag-drop default to `Default` textureType, which makes sprite-related fields no-op.
 
+### SetPluginPlatform
+Configures a native plugin's platform compatibility on its **PluginImporter** — the settings shown in the plugin Inspector's "Select platforms for plugin" panel. PluginImporter exposes these only through methods (`SetCompatibleWithPlatform` / `SetCompatibleWithAnyPlatform` / `SetCompatibleWithEditor` / `SetPlatformData`), which `SetImporterProperty` (reflection on fields/properties) cannot reach.
+```json
+{
+    "action": "SetPluginPlatform",
+    "parameters": [
+        { "key": "assetPath", "value": "Assets/Plugins/UnduguNativeFileDialogMac.mm" },
+        { "key": "platform", "value": "StandaloneOSX" },
+        { "key": "enable", "value": "true" },
+        { "key": "dataKey", "value": "CPU" },
+        { "key": "dataValue", "value": "AnyCPU" }
+    ]
+}
+```
+- `assetPath` (required): path to the plugin asset (`.mm`, `.dylib`, `.dll`, `.so`, `.a`, `.bundle`, …).
+- `platform` (required): `"AnyPlatform"`, `"Editor"`, or a `BuildTarget` enum name (`"StandaloneOSX"`, `"iOS"`, `"Android"`, `"StandaloneWindows64"`, …).
+- `enable` (required): `"true"` / `"false"`.
+- `dataKey` / `dataValue` (optional): per-platform data via `SetPlatformData` — e.g. `CPU` = `AnyCPU` / `x86_64` / `ARM64`, `OS` for Editor.
+- Calls `SaveAndReimport()` — the rewritten `.meta` (with the `PluginImporter:` block) is what must be committed.
+- Typical use: enable an Objective-C++ source plugin (`.mm`) for `StandaloneOSX` so its `extern "C"` symbols compile into the IL2CPP GameAssembly (fixes `Undefined symbols ... referenced from [DllImport("__Internal")]` link errors). One task per platform/flag — e.g. disable `AnyPlatform`, disable `Editor`, enable `StandaloneOSX`.
+
 ### GetPlayerPref
 Read a key from Unity's `PlayerPrefs`. Returns a JSON object in `task.result`: `{"hasKey":bool,"key":"...","type":"...","value":...}`. When `hasKey:false`, no `type`/`value` fields are present.
 ```json
@@ -1296,6 +1320,21 @@ Remove a key (or all keys when `key="*"`) from `PlayerPrefs`. Idempotent.
 }
 ```
 - `key` (required): the PlayerPrefs key to delete; pass `"*"` to call `PlayerPrefs.DeleteAll()` (use with care).
+
+### ImportUnityPackage
+Import a `.unitypackage` into the project via `AssetDatabase.ImportPackage` (non-interactive by default). Use for third-party SDK drops that are distributed as unitypackages (e.g. Google Sign-In, Facebook SDK).
+```json
+{
+    "action": "ImportUnityPackage",
+    "parameters": [
+        { "key": "path", "value": "/absolute/or/project-relative/path/to/Plugin.unitypackage" }
+    ]
+}
+```
+- `path` (required): the `.unitypackage` file. Absolute paths are allowed (the file does not need to live inside the project).
+- `interactive` (optional, default `"false"`): `"true"` shows Unity's import-selection dialog (blocks automation — avoid in scenarios).
+- Result: `"Import requested: <file>"`. Completion/failure is logged (`✓ unitypackage import completed` / `✗ unitypackage import FAILED`).
+- ⚠️ Script-bearing packages recompile/domain-reload AFTER the task completes — always follow the scenario with `quick_refresh.py full --focus --wait` + `monitor_editmode_logs.py --errors` before using the imported types.
 
 ## Common Mistakes to Avoid
 
