@@ -14,7 +14,18 @@ os.environ['PYTHONDONTWRITEBYTECODE'] = '1'
 import sqlite3
 from pathlib import Path
 import json
-from datetime import datetime
+from datetime import datetime, timedelta
+
+_DOTNET_EPOCH = datetime(1, 1, 1)
+
+def _dotnet_ticks_days_ago(days: int) -> int:
+    """Return a .NET DateTime tick count for `days` ago in local time.
+
+    Mirrors test_coordinator._dotnet_ticks_now so cleanup cutoffs are comparable
+    with the tick values actually stored in created_at columns.
+    """
+    delta = (datetime.now() - timedelta(days=days)) - _DOTNET_EPOCH
+    return delta.days * 864_000_000_000 + delta.seconds * 10_000_000 + delta.microseconds * 10
 
 def get_project_root():
     """Find Unity project root by looking for Assets folder"""
@@ -207,12 +218,29 @@ def apply_migration_v3(conn):
     cursor = conn.cursor()
     
     try:
-        # Clean old test requests (older than 7 days)
+        # Clean old test requests (older than 7 days).
+        #
+        # created_at is stored either as an INT64 .NET tick count (sqlite-net on the
+        # Unity side, and Python inserts, both use ticks) or as legacy TEXT. SQLite
+        # sorts every INTEGER before every TEXT, so comparing a tick value against
+        # datetime('now', ...) is unconditionally true and would delete live rows -
+        # including the request a --wait is currently polling. Compare each storage
+        # class against a cutoff of its own type.
+        cutoff_ticks = _dotnet_ticks_days_ago(7)
+
         cursor.execute("""
-            DELETE FROM test_requests 
-            WHERE created_at < datetime('now', '-7 days')
-        """)
+            DELETE FROM test_requests
+            WHERE typeof(created_at) IN ('integer', 'real')
+              AND created_at < ?
+        """, (cutoff_ticks,))
         deleted_tests = cursor.rowcount
+
+        cursor.execute("""
+            DELETE FROM test_requests
+            WHERE typeof(created_at) = 'text'
+              AND created_at < datetime('now', '-7 days')
+        """)
+        deleted_tests += cursor.rowcount
         
         # Clean old test results
         cursor.execute("""

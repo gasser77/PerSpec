@@ -16,34 +16,42 @@ import json
 from test_coordinator import TestCoordinator, TestPlatform, TestRequestType
 
 def check_compilation_errors():
-    """Check if there are any compilation errors in Unity"""
+    """Check whether the current Unity EditMode session logged compilation errors.
+
+    Reads the newest EditMode session log directly. The previous implementation shelled
+    out to a 'quick_logs.py' script that no longer exists, so it always failed silently
+    and reported "no errors" - removing the one guard meant to stop a doomed run.
+
+    Only the newest session is inspected: older session files keep errors that have
+    already been fixed, and treating those as current would block every run.
+    """
     try:
-        # Run quick_logs.py errors command and capture output
-        script_dir = os.path.dirname(os.path.abspath(__file__))
-        result = subprocess.run(
-            [sys.executable, os.path.join(script_dir, 'quick_logs.py'), 'errors', '--json'],
-            capture_output=True,
-            text=True,
-            timeout=10
+        from monitor_editmode_logs import (
+            get_session_files,
+            read_session_logs,
+            is_compilation_error,
         )
-        
-        if result.returncode == 0:
-            # No errors found
-            return False, None
-        else:
-            # Parse error output if in JSON format
-            try:
-                errors = json.loads(result.stdout)
-                error_count = len(errors) if isinstance(errors, list) else 0
-                return True, f"Found {error_count} compilation error(s)"
-            except:
-                # If not JSON, just check if there's output
-                if result.stdout.strip():
-                    return True, "Compilation errors detected"
-                return False, None
-    except subprocess.TimeoutExpired:
-        print("Warning: Compilation check timed out")
+    except ImportError as e:
+        print(f"Warning: could not load the log reader, skipping compilation check: {e}")
         return False, None
+
+    try:
+        sessions = get_session_files()
+        if not sessions:
+            # No logs yet (fresh project / Unity never opened) - nothing to judge.
+            return False, None
+
+        logs = read_session_logs(
+            sessions[0]['path'],
+            level_filter=['Error', 'Exception', 'Assert']
+        )
+        errors = [log for log in logs if is_compilation_error(log.get('message', ''))]
+
+        if not errors:
+            return False, None
+
+        first = errors[0].get('message', '').strip().splitlines()[0]
+        return True, f"Found {len(errors)} compilation error(s) in the current Unity session.\nFirst: {first}"
     except Exception as e:
         print(f"Warning: Could not check for compilation errors: {e}")
         return False, None
@@ -53,9 +61,11 @@ def main():
     sys.stdout.reconfigure(encoding='utf-8', errors='replace')
 
     parser = argparse.ArgumentParser(description='Quick Unity test runner')
-    parser.add_argument('action', choices=['all', 'class', 'method', 'category', 'status', 'cancel'],
+    parser.add_argument('action', choices=['all', 'class', 'method', 'category', 'status', 'cancel', 'stuck'],
                        help='Action to perform')
     parser.add_argument('target', nargs='?', help='Target (class/method/category name or request ID)')
+    parser.add_argument('--repair', action='store_true',
+                       help='With "stuck": cancel every non-terminal request that is listed')
     parser.add_argument('-p', '--platform', choices=['edit', 'play', 'both'], default='edit',
                        help='Test platform (default: edit)')
     parser.add_argument('--priority', type=int, default=0,
@@ -82,7 +92,24 @@ def main():
     coordinator = TestCoordinator()
     
     try:
-        if args.action == 'status':
+        if args.action == 'stuck':
+            stuck = coordinator.get_nonterminal_requests()
+            if not stuck:
+                print("No in-flight or stuck test requests")
+            else:
+                print(f"In-flight / stuck test requests ({len(stuck)}):")
+                for req in stuck:
+                    print(f"  #{req['id']}: {req['request_type']} on {req['test_platform']} "
+                          f"- status '{req['status']}', {coordinator.describe_age(req['created_at'])}")
+
+                if args.repair:
+                    print("\nCancelling the requests listed above...")
+                    for req in stuck:
+                        coordinator.cancel_request(req['id'])
+                else:
+                    print("\nRun with --repair to cancel these requests")
+
+        elif args.action == 'status':
             if not args.target:
                 # Show all pending requests
                 requests = coordinator.get_pending_requests()
@@ -93,6 +120,15 @@ def main():
                               f"(priority: {req['priority']})")
                 else:
                     print("No pending test requests")
+
+                # Pending-only used to hide runs that Unity started but never finished.
+                in_flight = [r for r in coordinator.get_nonterminal_requests()
+                             if r['status'] != 'pending']
+                if in_flight:
+                    print("\nIn-flight (not yet terminal):")
+                    for req in in_flight:
+                        print(f"  #{req['id']}: {req['request_type']} on {req['test_platform']} "
+                              f"- status '{req['status']}', {coordinator.describe_age(req['created_at'])}")
             else:
                 # Show specific request status
                 request_id = int(args.target)
@@ -139,7 +175,7 @@ def main():
                     print("\nTests cannot run with compilation errors.")
                     print("Tests will be marked as INCONCLUSIVE.")
                     print("\nTo fix:")
-                    print("1. Run: python PerSpec/Coordination/Scripts/quick_logs.py errors")
+                    print("1. Run: python PerSpec/Coordination/Scripts/monitor_editmode_logs.py --errors")
                     print("2. Fix the compilation errors")
                     print("3. Refresh Unity again")
                     print("4. Check for errors again")
@@ -165,21 +201,40 @@ def main():
                 except Exception as e:
                     print(f"Could not focus Unity: {e}")
             
-            # Submit the request
-            request_id = coordinator.submit_test_request(
-                request_type,
-                platform,
-                test_filter,
-                args.priority
-            )
-            
-            # Wait if requested
-            if args.wait:
-                print(f"Waiting for completion (timeout: {args.timeout}s)...")
-                final_status = coordinator.wait_for_completion(request_id, args.timeout)
-                coordinator.print_summary(request_id)
+            # Unity cannot run EditMode and PlayMode tests in a single test run, so
+            # 'both' is submitted as two separate requests rather than one request
+            # Unity would have to reject.
+            if args.platform == 'both':
+                platforms = [TestPlatform.EDIT_MODE, TestPlatform.PLAY_MODE]
             else:
-                print(f"Use 'python quick_test.py status {request_id}' to check progress")
+                platforms = [platform]
+
+            request_ids = []
+
+            for index, target_platform in enumerate(platforms):
+                if len(platforms) > 1:
+                    print(f"\n--- {target_platform.value} ---")
+
+                request_id = coordinator.submit_test_request(
+                    request_type,
+                    target_platform,
+                    test_filter,
+                    args.priority
+                )
+                request_ids.append(request_id)
+
+                if args.wait:
+                    print(f"Waiting for completion (timeout: {args.timeout}s)...")
+                    coordinator.wait_for_completion(request_id, args.timeout)
+                    coordinator.print_summary(request_id)
+                elif len(platforms) > 1 and index == 0:
+                    # Without --wait both requests are queued at once; Unity's single
+                    # dispatch funnel still runs them one after the other.
+                    continue
+
+            if not args.wait:
+                for request_id in request_ids:
+                    print(f"Use 'python quick_test.py status {request_id}' to check progress")
     
     except KeyboardInterrupt:
         print("\nOperation cancelled")

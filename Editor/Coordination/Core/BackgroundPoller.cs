@@ -24,7 +24,17 @@ namespace PerSpec.Editor.Coordination
         
         // Track if we're currently processing to avoid overlapping operations
         private static bool _isProcessing = false;
-        
+
+        // EditorPrefs is a main-thread-only API, but the poll callback runs on a
+        // ThreadPool thread. Cache the value from the main thread and read the cache
+        // in the callback - reading EditorPrefs there could throw, killing the timer
+        // thread silently and leaving polling permanently dead.
+        private static volatile bool _perspecEnabledCache = true;
+
+        // Watchdog for a main-thread Post that never got pumped (editor asleep/frozen).
+        private static DateTime _postPendingSince = DateTime.MinValue;
+        private const double POST_WATCHDOG_SECONDS = 30.0;
+
         static BackgroundPoller()
         {
             // Check if PerSpec is initialized
@@ -36,6 +46,7 @@ namespace PerSpec.Editor.Coordination
 
             // Check if PerSpec is enabled by checking EditorPrefs directly
             bool isEnabled = EditorPrefs.GetBool("PerSpec_Enabled", true);
+            _perspecEnabledCache = isEnabled;
             if (!isEnabled)
             {
                 Debug.Log("[BackgroundPoller] PerSpec is disabled - background polling will not start");
@@ -51,16 +62,18 @@ namespace PerSpec.Editor.Coordination
             try
             {
                 _dbManager = new SQLiteManager();
-                
+
                 // Only proceed if database is ready
                 if (!_dbManager.IsInitialized)
                 {
+                    Debug.LogWarning("[BackgroundPoller] Database not ready - background polling DISABLED. " +
+                                     "Open Tools > PerSpec > Control Center to initialize the database.");
                     return;
                 }
             }
-            catch (Exception)
+            catch (Exception e)
             {
-                // Silent failure
+                Debug.LogWarning($"[BackgroundPoller] Database init failed - background polling DISABLED: {e.Message}");
                 return;
             }
             
@@ -83,6 +96,7 @@ namespace PerSpec.Editor.Coordination
             {
                 // Check if PerSpec is enabled by checking EditorPrefs directly
                 bool isEnabled = EditorPrefs.GetBool("PerSpec_Enabled", true);
+                _perspecEnabledCache = isEnabled;
                 if (!isEnabled)
                 {
                     Debug.Log("[BackgroundPoller] Cannot enable - PerSpec is disabled");
@@ -132,56 +146,85 @@ namespace PerSpec.Editor.Coordination
         
         private static void BackgroundPollCallback(object state)
         {
-            // Skip if already processing, disabled, or PerSpec is disabled
-            bool perspecEnabled = EditorPrefs.GetBool("PerSpec_Enabled", true);
-            if (!_isEnabled || _isProcessing || !perspecEnabled)
+            // Skip if already processing, disabled, or PerSpec is disabled.
+            // _perspecEnabledCache is used instead of EditorPrefs because this runs on a
+            // ThreadPool thread where Unity editor APIs are not legal to call.
+            if (!_isEnabled || !_perspecEnabledCache)
             {
                 return;
             }
-            
+
+            if (_isProcessing)
+            {
+                // Watchdog: a posted callback only runs when the editor pumps its main loop.
+                // If the editor stayed asleep (or the post was dropped) the flag would latch
+                // on forever and kill polling for the session, so release it after a grace
+                // period and let the next tick re-post.
+                if ((DateTime.Now - _postPendingSince).TotalSeconds < POST_WATCHDOG_SECONDS)
+                {
+                    return;
+                }
+
+                UnityEngine.Debug.LogWarning("[BackgroundPoller-Thread] Main-thread dispatch did not run within " +
+                                             $"{POST_WATCHDOG_SECONDS}s - releasing lock and retrying");
+                _isProcessing = false;
+            }
+
+            bool posted = false;
+
             try
             {
                 _isProcessing = true;
-                
-                // Database operations are thread-safe with SQLite WAL mode
+
+                // Database operations are thread-safe with SQLite WAL mode.
+                // Refresh requests are deliberately NOT handled here - AssetRefreshCoordinator
+                // owns that queue, including its own background timer and the compile-aware
+                // two-phase handling that lets `quick_refresh.py --wait` block through
+                // compilation. A bare AssetDatabase.Refresh here raced it and marked requests
+                // completed before compilation had even started.
                 bool hasTestRequests = CheckForPendingTestRequests();
-                bool hasRefreshRequests = CheckForPendingRefreshRequests();
-                
-                if (hasTestRequests || hasRefreshRequests)
+
+                if (hasTestRequests)
                 {
-                    Debug.Log($"[BackgroundPoller-Thread] Found pending requests - Test: {hasTestRequests}, Refresh: {hasRefreshRequests}");
-                    
+                    Debug.Log("[BackgroundPoller-Thread] Found pending test request(s)");
+
                     // Marshal the processing back to Unity's main thread
-                    _unitySyncContext?.Post(_ =>
+                    var context = _unitySyncContext;
+                    if (context != null)
                     {
-                        try
+                        posted = true;
+                        _postPendingSince = DateTime.Now;
+                        context.Post(_ =>
                         {
-                            Debug.Log("[BackgroundPoller-MainThread] Processing pending requests on main thread");
-                            
-                            if (hasTestRequests)
+                            try
                             {
+                                // Refresh the cached enable flag while we are legally on the main thread.
+                                _perspecEnabledCache = EditorPrefs.GetBool("PerSpec_Enabled", true);
+                                if (!_perspecEnabledCache) return;
+
+                                Debug.Log("[BackgroundPoller-MainThread] Processing pending requests on main thread");
+
                                 // Trigger test processing
                                 ProcessPendingTestRequest();
+
+                                // NOTE: Do NOT call CompilationPipeline.RequestScriptCompilation() here.
+                                // A forced compile triggers a domain reload that destroys the in-flight
+                                // TestExecutor, its EditorApplication.update file monitor and its
+                                // ICallbacks registration - stranding the request at processing/executing
+                                // forever. AssetRefreshCoordinator removed the same anti-pattern in 1.7.0.
                             }
-                            
-                            if (hasRefreshRequests)
+                            catch (Exception ex)
                             {
-                                // Trigger refresh processing
-                                ProcessPendingRefreshRequest();
+                                Debug.LogError($"[BackgroundPoller-MainThread] Error processing requests: {ex.Message}");
                             }
-                            
-                            // Force script compilation to ensure Unity processes everything
-                            if (hasTestRequests || hasRefreshRequests)
+                            finally
                             {
-                                Debug.Log("[BackgroundPoller-MainThread] Requesting script compilation");
-                                CompilationPipeline.RequestScriptCompilation();
+                                // Released only once the main-thread work is actually done, so the
+                                // next timer tick cannot queue a duplicate dispatch behind this one.
+                                _isProcessing = false;
                             }
-                        }
-                        catch (Exception ex)
-                        {
-                            Debug.LogError($"[BackgroundPoller-MainThread] Error processing requests: {ex.Message}");
-                        }
-                    }, null);
+                        }, null);
+                    }
                 }
             }
             catch (Exception ex)
@@ -192,7 +235,11 @@ namespace PerSpec.Editor.Coordination
             }
             finally
             {
-                _isProcessing = false;
+                // When work was posted, the Post callback owns clearing the flag.
+                if (!posted)
+                {
+                    _isProcessing = false;
+                }
             }
         }
         
@@ -210,36 +257,15 @@ namespace PerSpec.Editor.Coordination
             }
         }
         
-        private static bool CheckForPendingRefreshRequests()
-        {
-            try
-            {
-                // Direct database check - thread safe
-                var request = _dbManager.GetNextPendingRefreshRequest();
-                return request != null;
-            }
-            catch
-            {
-                return false;
-            }
-        }
-        
         private static void ProcessPendingTestRequest()
         {
             try
             {
-                // Get the request again on main thread
-                var request = _dbManager.GetNextPendingRequest();
-                if (request != null)
-                {
-                    Debug.Log($"[BackgroundPoller] Processing test request #{request.Id}");
-                    
-                    // Delegate to TestCoordinatorEditor which has proper database update logic
-                    TestCoordinatorEditor.ProcessTestRequest(request);
-                    
-                    _dbManager.LogExecution(request.Id, "INFO", "BackgroundPoller", 
-                        "Test request triggered via background polling and delegated to TestCoordinator");
-                }
+                // Route through the single guarded dispatch entry point. It re-reads the
+                // request on the main thread and enforces the busy / compiling / play-mode
+                // guards, so this poller can never double-dispatch a run that
+                // TestCoordinatorEditor's own update loop already picked up.
+                TestCoordinatorEditor.TryDispatchNextRequest();
             }
             catch (Exception ex)
             {
@@ -247,36 +273,6 @@ namespace PerSpec.Editor.Coordination
             }
         }
         
-        
-        private static void ProcessPendingRefreshRequest()
-        {
-            try
-            {
-                // Get the request again on main thread
-                var request = _dbManager.GetNextPendingRefreshRequest();
-                if (request != null)
-                {
-                    Debug.Log($"[BackgroundPoller] Processing refresh request #{request.Id}");
-                    
-                    // Update status to running
-                    _dbManager.UpdateRefreshRequestStatus(request.Id, "running");
-                    
-                    // Execute the refresh
-                    AssetDatabase.Refresh();
-                    
-                    // Mark as completed
-                    _dbManager.UpdateRefreshRequestStatus(request.Id, "completed", 
-                        "Refresh triggered via background polling");
-                    
-                    _dbManager.LogExecution(request.Id, "INFO", "BackgroundPoller", 
-                        "Refresh request triggered via background polling");
-                }
-            }
-            catch (Exception ex)
-            {
-                Debug.LogError($"[BackgroundPoller] Error processing refresh request: {ex.Message}");
-            }
-        }
         
         // Menu items for manual control
         // Methods now accessed via Control Center

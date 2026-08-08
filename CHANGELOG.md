@@ -5,6 +5,38 @@ All notable changes to the PerSpec Testing Framework will be documented in this 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.8.0] - 2026-08-07
+
+### Fixed
+- **EditMode tests got stuck and never executed (primary fix)**
+  - Symptom: a submitted EditMode request sat at `pending`, or reached `processing`/`executing` and never moved. `quick_test.py --wait` then burned its full 300s timeout with no explanation.
+  - Root cause: both background pollers called `CompilationPipeline.RequestScriptCompilation()` in the *same main-thread callback* that had just called `TestRunnerApi.Execute()`. The forced compile triggered a domain reload that destroyed the in-flight `TestExecutor`, its `EditorApplication.update` file monitor and its registered `ICallbacks` — so nothing was left alive to finish the run or write a terminal status. `AssetRefreshCoordinator` removed this same anti-pattern in 1.7.0; the test dispatch path never got the fix.
+  - The forced compile is gone from both `BackgroundPoller` and `TestCoordinatorEditor`. The user-invoked `Force Script Compilation` action in the Control Center is unchanged.
+- **Duplicate dispatch from three independent pollers** — `TestCoordinatorEditor`'s update loop, its own timer, and `BackgroundPoller` each read `test_requests` and dispatched. `BackgroundPoller.ProcessPendingTestRequest` never checked whether a run was already active, and its `_isProcessing` guard was released when the main-thread callback was *queued* rather than when it completed, so a second dispatch could be queued behind the first. All wake-up sources now funnel through a single guarded `TestCoordinatorEditor.TryDispatchNextRequest()`.
+- **Class-level test runs matched zero tests** — `CreateTestFilter` put the class name in `Filter.testNames`, which requires an exact full-name match a class name can never satisfy. Runs "completed" with 0 tests. Class requests now use `Filter.groupNames` with an anchored regex, selecting the class and every method beneath it.
+- **`timeout` and `inconclusive` statuses were immediately overwritten** — `OnTestComplete` unconditionally wrote `failed`/`completed` over the precise status `TestExecutor` had just written, so a timed-out run reported `failed` and a skipped-only run reported `completed`. Terminal statuses are now never downgraded.
+- **Requests could be stranded at `finalizing` forever** — `RunFinished` set its completion flag and stopped file monitoring *before* saving results, so any exception in between left the row with no remaining path to a terminal state. Result persistence is now isolated so the terminal write always happens, and a late failure marks the request `failed` instead of parking it.
+- **Orphan recovery always discarded real results** — `FindAppDataTestResult` probed `LocalAppData\Unity\Editor\TestResults.xml`, but Unity writes to `LocalAppDataLow\{Company}\{Product}\`. Recovery therefore never found results and marked every interrupted run `failed`. All recovery paths now share one candidate-path helper (`TestExecutor.GetAppDataResultCandidatePaths`).
+- **TestRunnerApi callbacks leaked between runs** — the file-monitor completion path never called `Cleanup()`, and a later `RunFinished` early-returned before reaching its own cleanup. Stale `TestResultXMLExporter` instances accumulated and wrote extra XML on every subsequent run. The file-monitor and timeout paths now tear down fully.
+- **Coordination could be silently disabled for a whole session** — a locked or unreadable database made `SQLiteManager` initialization fail without a word, and both pollers then returned from their static constructors in silence. All three now log a single explicit warning.
+- **`EditorPrefs` was read from a ThreadPool thread** in `BackgroundPoller.BackgroundPollCallback`, outside the try block. A throw there killed the timer callback and left the processing flag latched on. The value is now cached from the main thread, and a watchdog releases the flag if a queued main-thread dispatch never runs.
+- **`StartedAt` was never set on the real pipeline** — it was stamped only for the `running` status, which the live path never writes (it writes `processing` then `executing`), leaving every duration fallback dead. Now stamped on the first active status, once.
+- **`quick_test.py` pre-flight compilation check never worked** — it shelled out to `quick_logs.py`, a script that no longer exists, so it always reported "[OK] No compilation errors" and never blocked a doomed run. It now reads the newest EditMode session log directly via `monitor_editmode_logs`.
+- **Maintenance migration v3 could delete live requests** — `DELETE FROM test_requests WHERE created_at < datetime('now','-7 days')` compared INT64 tick values against text. SQLite sorts all integers before all text, so the predicate was unconditionally true for tick-stored rows. The delete is now split by `typeof(created_at)` with a matching tick cutoff.
+
+### Added
+- **Compile and play-mode dispatch guards** — a run is never started while Unity is compiling, importing assets, or entering play mode. Blocked requests stay `pending` and dispatch on a later tick, so they self-heal with no user action.
+- **Domain-reload persistence and recovery for test runs** — the in-flight request id and dispatch time are stored in `SessionState` (parity with the 1.7.0 refresh work). After a reload, `RecoverInterruptedTestRequest` completes the run from results found on disk, otherwise re-queues it for **one** automatic retry, otherwise marks it `failed`. A request is never left non-terminal.
+- **Self-healing `test_requests` CHECK constraint in C#** — mirrors the existing `asset_refresh_requests` repair. A database created by an older Python initializer that rejects `finalizing`/`timeout`/`inconclusive` is rebuilt on editor load, instead of silently freezing rows at their previous status.
+- **`quick_test.py stuck [--repair]`** — lists every non-terminal request with its status and age; `--repair` cancels them. Plain `quick_test.py status` now also reports in-flight requests, not just pending ones.
+- **Actionable hint while waiting** — if a request is still `pending` after 15 seconds, `--wait` explains the likely causes (unfocused editor, compiling, coordination disabled) instead of staying silent until timeout.
+- **`TestExecutor.Abort()`** — tears down a cancelled run's monitor and callbacks so they do not leak into the next run.
+
+### Changed
+- **`-p both` submits two separate requests** (EditMode then PlayMode). Unity cannot run both modes in a single `TestRunnerApi.Execute` call; the combined form is now rejected in C# with a clear message instead of silently running nothing.
+- **`cancel` covers all non-terminal statuses** — previously only `pending` and `running` could be cancelled, so a request wedged at `processing`/`executing`/`finalizing` (exactly the one needing intervention) could not be cleared from Python.
+- **`TestCoordinatorEditor`'s internal polling timer is disabled by default** — `BackgroundPoller` already owns the unfocused-editor wake-up for both tests and refreshes and now funnels into the shared dispatch entry point. The timer code remains and can be re-enabled; only the duplication is gone.
+
 ## [1.7.1] - 2026-07-10
 
 ### Fixed

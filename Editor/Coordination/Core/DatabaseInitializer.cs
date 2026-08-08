@@ -1,5 +1,6 @@
 using System;
 using System.IO;
+using System.Linq;
 using UnityEngine;
 using UnityEditor;
 using SQLite;
@@ -92,6 +93,7 @@ namespace PerSpec.Editor.Coordination
 
                     // Repair schemas that predate current constraints (self-healing migration)
                     EnsureRefreshStatusConstraint(connection);
+                    EnsureTestStatusConstraint(connection);
 
                     // Initialize system status if empty
                     InitializeSystemStatus(connection);
@@ -126,6 +128,7 @@ namespace PerSpec.Editor.Coordination
                 {
                     connection.BusyTimeout = TimeSpan.FromSeconds(5);
                     EnsureRefreshStatusConstraint(connection);
+                    EnsureTestStatusConstraint(connection);
                 }
 
                 return true;
@@ -364,6 +367,79 @@ namespace PerSpec.Editor.Coordination
             });
 
             Debug.Log("[DatabaseInitializer] Upgraded asset_refresh_requests constraint (added 'compiling')");
+        }
+
+        /// <summary>
+        /// Self-healing migration for the test_requests status CHECK constraint.
+        /// Databases created by an older Python db_initializer carry a constraint that
+        /// predates 'finalizing', 'timeout' and 'inconclusive'. Writing one of those
+        /// statuses then throws "CHECK constraint failed", the error is swallowed, and the
+        /// request keeps its previous status - which is one way a run appears stuck.
+        /// SQLite cannot ALTER a CHECK constraint, so rebuild the table.
+        /// Idempotent, and a no-op on tables that have no status CHECK at all.
+        /// </summary>
+        private static void EnsureTestStatusConstraint(SQLiteConnection connection)
+        {
+            var tableSql = connection.ExecuteScalar<string>(
+                "SELECT sql FROM sqlite_master WHERE type='table' AND name='test_requests'");
+
+            if (string.IsNullOrEmpty(tableSql)) return;
+
+            // No CHECK on this table (C#-created schema): nothing can be rejected.
+            if (!tableSql.Contains("CHECK")) return;
+
+            // Already permits the full status set.
+            string[] required = { "'pending'", "'processing'", "'executing'", "'finalizing'",
+                                  "'running'", "'completed'", "'failed'", "'timeout'",
+                                  "'cancelled'", "'inconclusive'" };
+            if (required.All(status => tableSql.Contains(status))) return;
+
+            connection.RunInTransaction(() =>
+            {
+                connection.Execute("DROP TABLE IF EXISTS test_requests_new");
+                connection.Execute(@"
+                    CREATE TABLE test_requests_new (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        request_type TEXT NOT NULL CHECK(request_type IN ('all', 'class', 'method', 'category')),
+                        test_filter TEXT,
+                        test_platform TEXT NOT NULL CHECK(test_platform IN ('EditMode', 'PlayMode', 'Both')),
+                        status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN (
+                            'pending', 'processing', 'executing', 'finalizing',
+                            'running', 'completed', 'failed', 'timeout',
+                            'cancelled', 'inconclusive'
+                        )),
+                        priority INTEGER DEFAULT 0,
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        started_at TIMESTAMP,
+                        completed_at TIMESTAMP,
+                        result_summary TEXT,
+                        error_message TEXT,
+                        total_tests INTEGER DEFAULT 0,
+                        passed_tests INTEGER DEFAULT 0,
+                        failed_tests INTEGER DEFAULT 0,
+                        skipped_tests INTEGER DEFAULT 0,
+                        duration_seconds REAL DEFAULT 0.0
+                    )
+                ");
+                connection.Execute(@"
+                    INSERT INTO test_requests_new (
+                        id, request_type, test_filter, test_platform, status, priority,
+                        created_at, started_at, completed_at, result_summary, error_message,
+                        total_tests, passed_tests, failed_tests, skipped_tests, duration_seconds
+                    )
+                    SELECT
+                        id, request_type, test_filter, test_platform, status, priority,
+                        created_at, started_at, completed_at, result_summary, error_message,
+                        total_tests, passed_tests, failed_tests, skipped_tests, duration_seconds
+                    FROM test_requests
+                ");
+                connection.Execute("DROP TABLE test_requests");
+                connection.Execute("ALTER TABLE test_requests_new RENAME TO test_requests");
+                connection.Execute("CREATE INDEX IF NOT EXISTS idx_test_requests_status ON test_requests(status)");
+                connection.Execute("CREATE INDEX IF NOT EXISTS idx_test_requests_created ON test_requests(created_at DESC)");
+            });
+
+            Debug.Log("[DatabaseInitializer] Upgraded test_requests status constraint (added finalizing/timeout/inconclusive)");
         }
 
         private static void InitializeSystemStatus(SQLiteConnection connection)

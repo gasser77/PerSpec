@@ -52,14 +52,46 @@ namespace PerSpec.Editor.Coordination
             _dbManager = dbManager;
             _testResults = new Dictionary<string, TestResult>();
             _testApi = ScriptableObject.CreateInstance<TestRunnerApi>();
-            
+
+            // Without this the ScriptableObject is destroyed on scene change / reload while
+            // this instance still holds the reference, so later UnregisterCallbacks/Execute
+            // calls hit a fake-null object and throw.
+            _testApi.hideFlags = HideFlags.HideAndDontSave;
+
             // Initialize test results path
             string projectPath = Directory.GetParent(Application.dataPath).FullName;
             _testResultsPath = Path.Combine(projectPath, "PerSpec", "TestResults");
         }
+
+        /// <summary>
+        /// The locations Unity itself may write TestResults.xml to, in order of likelihood.
+        /// Unity writes under LocalAppDataLow\{Company}\{Product} - NOT LocalAppData\Unity\Editor.
+        /// Shared so every recovery path probes the same folders.
+        /// </summary>
+        internal static IEnumerable<string> GetAppDataResultCandidatePaths()
+        {
+            string appDataPath = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData) + "Low";
+            string projectFolderName = Path.GetFileName(Directory.GetParent(Application.dataPath).FullName);
+
+            yield return Path.Combine(appDataPath, Application.companyName, Application.productName, "TestResults.xml");
+            yield return Path.Combine(appDataPath, "DefaultCompany", Application.productName, "TestResults.xml");
+            yield return Path.Combine(appDataPath, "DefaultCompany", "TestFramework", "TestResults.xml");
+            yield return Path.Combine(appDataPath, "DefaultCompany", projectFolderName, "TestResults.xml");
+        }
         
         public void ExecuteTests(TestRequest request, Filter filter, Action<TestRequest, bool, string, TestResultSummary> onComplete)
         {
+            // Starting a run while the editor is compiling guarantees the imminent domain
+            // reload destroys it. Fail loudly here rather than leaving a half-started run.
+            if (EditorApplication.isCompiling || EditorApplication.isUpdating)
+            {
+                const string message = "Cannot start tests while Unity is compiling or importing assets";
+                Debug.LogError($"[TestExecutor] {message}");
+                _dbManager.LogExecution(request.Id, "ERROR", "TestExecutor", message);
+                onComplete?.Invoke(request, false, message, null);
+                return;
+            }
+
             _currentRequest = request;
             _onComplete = onComplete;
             _currentSummary = new TestResultSummary();
@@ -199,8 +231,13 @@ namespace PerSpec.Editor.Coordination
                     // Stop file monitoring since callback worked
                     StopFileMonitoring();
                     
-                    // Calculate duration
-                    _currentSummary.Duration = Time.realtimeSinceStartup - _startTime;
+                    // Calculate duration.
+                    // Time.realtimeSinceStartup is not monotonic across editor domain
+                    // reloads, which produced negative durations. Prefer wall-clock from
+                    // when monitoring started and only fall back to the frame clock.
+                    _currentSummary.Duration = _monitorStartDateTime != default
+                        ? (float)(DateTime.Now - _monitorStartDateTime).TotalSeconds
+                        : Math.Max(0f, Time.realtimeSinceStartup - _startTime);
                     
                     // Update to finalizing status
                     _dbManager.UpdateRequestStatus(_currentRequest.Id, "finalizing");
@@ -209,14 +246,27 @@ namespace PerSpec.Editor.Coordination
                     // Process all test results
                     ProcessTestResults(result);
 
-                    // Save individual test results to database
-                    SaveTestResultsToDatabase();
+                    // Persisting results and importing XML must never block the terminal
+                    // status write below. Monitoring is already stopped and the completion
+                    // flag is already set at this point, so an escape here would strand the
+                    // request at 'finalizing' with no path out.
+                    try
+                    {
+                        // Save individual test results to database
+                        SaveTestResultsToDatabase();
 
-                    // Belt-and-braces: ensure the XML actually landed in PerSpec/TestResults
-                    // so the Python test_results.py viewer can see it. The XMLExporter
-                    // callback usually handles this, but if it didn't fire (PlayMode
-                    // reliability), copy Unity's AppData file in now.
-                    EnsureResultXmlInPerSpec();
+                        // Belt-and-braces: ensure the XML actually landed in PerSpec/TestResults
+                        // so the Python test_results.py viewer can see it. The XMLExporter
+                        // callback usually handles this, but if it didn't fire (PlayMode
+                        // reliability), copy Unity's AppData file in now.
+                        EnsureResultXmlInPerSpec();
+                    }
+                    catch (Exception persistEx)
+                    {
+                        Debug.LogError($"[TestExecutor] Error persisting results (continuing to completion): {persistEx.Message}");
+                        _dbManager.LogExecution(_currentRequest.Id, "ERROR", "TestExecutor",
+                            $"Error persisting results: {persistEx.Message}");
+                    }
 
                     // Now mark as fully completed
                     _dbManager.UpdateRequestStatus(_currentRequest.Id, "completed");
@@ -238,11 +288,30 @@ namespace PerSpec.Editor.Coordination
             catch (Exception e)
             {
                 Debug.LogError($"[TestExecutor] Error in RunFinished: {e.Message}");
-                
+
                 // Even if callback fails, try to complete via file monitoring
                 if (!_hasCompletedViaCallback)
                 {
                     Debug.Log($"[TestExecutor] Callback failed, relying on file monitoring");
+                }
+                else if (_currentRequest != null)
+                {
+                    // We already claimed the completion and stopped monitoring, so no other
+                    // path will finish this request. Give it a terminal status rather than
+                    // leaving it parked at 'finalizing' forever.
+                    var liveStatus = _dbManager.GetRequestStatus(_currentRequest.Id);
+                    if (liveStatus == "finalizing" || liveStatus == "executing" || liveStatus == "processing")
+                    {
+                        _dbManager.UpdateRequestStatus(_currentRequest.Id, "failed",
+                            $"Failed while finalizing results: {e.Message}");
+                        _dbManager.LogExecution(_currentRequest.Id, "ERROR", "TestExecutor",
+                            $"RunFinished threw after completion was claimed: {e.Message}");
+                    }
+
+                    var interruptedRequest = _currentRequest;
+                    var notify = _onComplete;
+                    Cleanup();
+                    notify?.Invoke(interruptedRequest, false, e.Message, null);
                 }
             }
         }
@@ -604,102 +673,85 @@ namespace PerSpec.Editor.Coordination
             // Fallback: Check Unity's default location in user's AppData
             try
             {
-                string appDataPath = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData) + "Low";
-                
-                // Try multiple possible locations in order of likelihood
-                string[] possiblePaths = new string[]
-                {
-                    // Primary: Use actual company and product names from Unity settings
-                    Path.Combine(appDataPath, Application.companyName, Application.productName),
-                    
-                    // Fallback 1: DefaultCompany with actual product name
-                    Path.Combine(appDataPath, "DefaultCompany", Application.productName),
-                    
-                    // Fallback 2: Hardcoded for TestFramework project (backward compatibility)
-                    Path.Combine(appDataPath, "DefaultCompany", "TestFramework"),
-                    
-                    // Fallback 3: DefaultCompany with project folder name
-                    Path.Combine(appDataPath, "DefaultCompany", Path.GetFileName(Directory.GetParent(Application.dataPath).FullName))
-                };
-                
+                // Shared candidate list - see GetAppDataResultCandidatePaths
+                string[] possiblePaths = GetAppDataResultCandidatePaths().ToArray();
+
                 // Try each possible path
-                foreach (var unityTestPath in possiblePaths)
+                foreach (var testResultFile in possiblePaths)
                 {
-                    if (Directory.Exists(unityTestPath))
+                    if (!File.Exists(testResultFile))
                     {
-                        var testResultFile = Path.Combine(unityTestPath, "TestResults.xml");
-                        if (File.Exists(testResultFile))
-                        {
-                            Debug.Log($"[TestExecutor] Found test results at: {testResultFile}");
-                            Debug.Log($"[TestExecutor] Company: {Application.companyName}, Product: {Application.productName}");
-
-                            // Guard: skip stale AppData files written before monitoring started.
-                            // Use _monitorStartDateTime which is set at the START of monitoring,
-                            // before StartedAt is available. This prevents previous run's results
-                            // from being treated as the current run's results.
-                            // For initial snapshot: no buffer (capture state at monitoring start)
-                            // For monitoring: allow 5 second backward buffer for clock skew
-                            DateTime cutoffTime = _monitorStartDateTime != default
-                                ? (forInitialSnapshot ? _monitorStartDateTime : _monitorStartDateTime.AddSeconds(-5))
-                                : DateTime.Now.AddMinutes(-5);  // Fallback: only use files from last 5 minutes
-
-                            Debug.Log($"[TestExecutor-FM-DEBUG] === AppData Check ===");
-                            var sourceInfo = new FileInfo(testResultFile);
-                            Debug.Log($"[TestExecutor-FM-DEBUG] Found AppData file: {testResultFile}");
-                            Debug.Log($"[TestExecutor-FM-DEBUG] AppData file LastWriteTime: {sourceInfo.LastWriteTime:O}");
-                            Debug.Log($"[TestExecutor-FM-DEBUG] AppData cutoff time: {cutoffTime:O}");
-                            Debug.Log($"[TestExecutor-FM-DEBUG] File passes freshness: {sourceInfo.LastWriteTime >= cutoffTime}");
-
-                            if (sourceInfo.LastWriteTime < cutoffTime)
-                            {
-                                Debug.Log($"[TestExecutor] Skipping stale AppData results: " +
-                                          $"file written {sourceInfo.LastWriteTime:s}, " +
-                                          $"cutoff time {cutoffTime:s}");
-                                continue;
-                            }
-
-                            // Copy to PerSpec/TestResults for consistency
-                            if (!Directory.Exists(_testResultsPath))
-                                Directory.CreateDirectory(_testResultsPath);
-
-                            string timestamp = DateTime.Now.ToString("yyyyMMdd_HHmmss");
-                            string destPath = Path.Combine(_testResultsPath, $"TestResults_{timestamp}.xml");
-                            File.Copy(testResultFile, destPath, true);
-                            Debug.Log($"[TestExecutor] Copied test results to: {destPath}");
-                            
-                            // We have a fresh AppData XML. The canonical completion path is
-                            // RunFinished (line ~180). Do NOT mark the request 'completed' here
-                            // unless RunFinished failed to fire AND the file is genuinely done.
-                            //
-                            // The previous code marked EditMode/method requests completed the
-                            // instant any fresh file appeared - racing the actual test run and
-                            // surfacing as "Request N not found" / empty results on the Python side.
-                            if (!forInitialSnapshot && _currentRequest != null && !_hasCompletedViaCallback)
-                            {
-                                // Upgrade processing -> executing once we know Unity is writing files.
-                                var liveStatus = _dbManager.GetRequestStatus(_currentRequest.Id);
-                                if (liveStatus == "processing" || liveStatus == "pending")
-                                {
-                                    _dbManager.UpdateRequestStatus(_currentRequest.Id, "executing");
-                                }
-
-                                // CheckAndProcessResultFile (called from the PerSpec branch in
-                                // CheckForNewResultFiles) is the single completion path. Letting
-                                // the regular monitoring loop pick up the freshly-copied destPath
-                                // means it will be subjected to size-stability + IsXmlComplete
-                                // checks before the request is marked completed.
-                                Debug.Log($"[TestExecutor-FM] Copied AppData XML to {destPath} - letting standard monitoring drive completion");
-                            }
-
-                            return destPath;
-                        }
+                        continue;
                     }
+
+                    Debug.Log($"[TestExecutor] Found test results at: {testResultFile}");
+                    Debug.Log($"[TestExecutor] Company: {Application.companyName}, Product: {Application.productName}");
+
+                    // Guard: skip stale AppData files written before monitoring started.
+                    // Use _monitorStartDateTime which is set at the START of monitoring,
+                    // before StartedAt is available. This prevents previous run's results
+                    // from being treated as the current run's results.
+                    // For initial snapshot: no buffer (capture state at monitoring start)
+                    // For monitoring: allow 5 second backward buffer for clock skew
+                    DateTime cutoffTime = _monitorStartDateTime != default
+                        ? (forInitialSnapshot ? _monitorStartDateTime : _monitorStartDateTime.AddSeconds(-5))
+                        : DateTime.Now.AddMinutes(-5);  // Fallback: only use files from last 5 minutes
+
+                    Debug.Log($"[TestExecutor-FM-DEBUG] === AppData Check ===");
+                    var sourceInfo = new FileInfo(testResultFile);
+                    Debug.Log($"[TestExecutor-FM-DEBUG] Found AppData file: {testResultFile}");
+                    Debug.Log($"[TestExecutor-FM-DEBUG] AppData file LastWriteTime: {sourceInfo.LastWriteTime:O}");
+                    Debug.Log($"[TestExecutor-FM-DEBUG] AppData cutoff time: {cutoffTime:O}");
+                    Debug.Log($"[TestExecutor-FM-DEBUG] File passes freshness: {sourceInfo.LastWriteTime >= cutoffTime}");
+
+                    if (sourceInfo.LastWriteTime < cutoffTime)
+                    {
+                        Debug.Log($"[TestExecutor] Skipping stale AppData results: " +
+                                  $"file written {sourceInfo.LastWriteTime:s}, " +
+                                  $"cutoff time {cutoffTime:s}");
+                        continue;
+                    }
+
+                    // Copy to PerSpec/TestResults for consistency
+                    if (!Directory.Exists(_testResultsPath))
+                        Directory.CreateDirectory(_testResultsPath);
+
+                    string timestamp = DateTime.Now.ToString("yyyyMMdd_HHmmss");
+                    string destPath = Path.Combine(_testResultsPath, $"TestResults_{timestamp}.xml");
+                    File.Copy(testResultFile, destPath, true);
+                    Debug.Log($"[TestExecutor] Copied test results to: {destPath}");
+
+                    // We have a fresh AppData XML. The canonical completion path is
+                    // RunFinished. Do NOT mark the request 'completed' here unless
+                    // RunFinished failed to fire AND the file is genuinely done.
+                    //
+                    // The previous code marked EditMode/method requests completed the
+                    // instant any fresh file appeared - racing the actual test run and
+                    // surfacing as "Request N not found" / empty results on the Python side.
+                    if (!forInitialSnapshot && _currentRequest != null && !_hasCompletedViaCallback)
+                    {
+                        // Upgrade processing -> executing once we know Unity is writing files.
+                        var liveStatus = _dbManager.GetRequestStatus(_currentRequest.Id);
+                        if (liveStatus == "processing" || liveStatus == "pending")
+                        {
+                            _dbManager.UpdateRequestStatus(_currentRequest.Id, "executing");
+                        }
+
+                        // CheckAndProcessResultFile (called from the PerSpec branch in
+                        // CheckForNewResultFiles) is the single completion path. Letting
+                        // the regular monitoring loop pick up the freshly-copied destPath
+                        // means it will be subjected to size-stability + IsXmlComplete
+                        // checks before the request is marked completed.
+                        Debug.Log($"[TestExecutor-FM] Copied AppData XML to {destPath} - letting standard monitoring drive completion");
+                    }
+
+                    return destPath;
                 }
-                
+
                 Debug.Log($"[TestExecutor] No test results found in any default locations. Searched:");
                 foreach (var path in possiblePaths)
                 {
-                    Debug.Log($"  - {Path.Combine(path, "TestResults.xml")}");
+                    Debug.Log($"  - {path}");
                 }
             }
             catch (Exception e)
@@ -813,8 +865,18 @@ namespace PerSpec.Editor.Coordination
                     Debug.Log($"[TestExecutor] Database status updated to '{terminalStatus}' for request {_currentRequest.Id}");
 
                     _hasCompletedViaCallback = true;
-                    _onComplete(_currentRequest, true, null, _currentSummary);
-                    StopFileMonitoring();
+
+                    var completedRequest = _currentRequest;
+                    var notify = _onComplete;
+                    var summary = _currentSummary;
+
+                    notify(completedRequest, true, null, summary);
+
+                    // Full teardown, not just StopFileMonitoring. A later RunFinished will
+                    // early-return on the completion guard and never reach its own Cleanup,
+                    // so without this the TestRunnerApi callbacks (including the XML exporter)
+                    // stay registered and pile up on every subsequent run.
+                    Cleanup();
                 }
                 else
                 {
@@ -854,18 +916,8 @@ namespace PerSpec.Editor.Coordination
                 }
 
                 // Walk Unity's AppData fallback locations and copy in the first match.
-                string appDataPath = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData) + "Low";
-                string[] candidateDirs =
+                foreach (var source in GetAppDataResultCandidatePaths())
                 {
-                    Path.Combine(appDataPath, Application.companyName, Application.productName),
-                    Path.Combine(appDataPath, "DefaultCompany", Application.productName),
-                    Path.Combine(appDataPath, "DefaultCompany", "TestFramework"),
-                    Path.Combine(appDataPath, "DefaultCompany", Path.GetFileName(Directory.GetParent(Application.dataPath).FullName)),
-                };
-
-                foreach (var dir in candidateDirs)
-                {
-                    string source = Path.Combine(dir, "TestResults.xml");
                     if (!File.Exists(source)) continue;
                     var sourceInfo = new FileInfo(source);
                     if (sourceInfo.LastWriteTime < cutoff) continue;
@@ -1067,9 +1119,34 @@ namespace PerSpec.Editor.Coordination
                     (float)timeoutValue
                 );
                 
-                _dbManager.LogExecution(_currentRequest.Id, "ERROR", "TestExecutor", 
+                _dbManager.LogExecution(_currentRequest.Id, "ERROR", "TestExecutor",
                     $"Test execution timed out after {timeoutValue} seconds");
-                _onComplete(_currentRequest, false, $"Test execution timed out after {timeoutValue} seconds", null);
+
+                var timedOutRequest = _currentRequest;
+                var notify = _onComplete;
+
+                notify(timedOutRequest, false, $"Test execution timed out after {timeoutValue} seconds", null);
+
+                // Release the TestRunnerApi callbacks - nothing else will do it on this path.
+                Cleanup();
+            }
+        }
+
+        /// <summary>
+        /// Tears down an in-flight run without reporting a result. Used when the run is
+        /// cancelled externally, so the monitor and TestRunnerApi callbacks do not leak
+        /// into the next run.
+        /// </summary>
+        internal void Abort()
+        {
+            try
+            {
+                _hasCompletedViaCallback = true;
+                Cleanup();
+            }
+            catch (Exception e)
+            {
+                Debug.LogWarning($"[TestExecutor] Error aborting run: {e.Message}");
             }
         }
         

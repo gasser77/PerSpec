@@ -303,10 +303,13 @@ namespace PerSpec.Editor.Coordination
                 _connection.BusyTimeout = TimeSpan.FromSeconds(5);
                 _isInitialized = true;
             }
-            catch (Exception)
+            catch (Exception e)
             {
                 _isInitialized = false;
-                // Silent failure - database might be locked or not ready
+                // A locked or unreadable database silently disabled all coordination, so
+                // requests sat pending with no clue why. Say so once, loudly.
+                Debug.LogWarning($"[SQLiteManager] Could not open {_dbPath} - PerSpec coordination is DISABLED " +
+                                 $"for this session: {e.Message}");
             }
         }
         
@@ -347,13 +350,25 @@ namespace PerSpec.Editor.Coordination
                     statusProp.SetValue(entity, status);
                 }
                 
-                // Set timestamps based on status
-                if (status == "running")
+                // Set timestamps based on status.
+                // The live test pipeline writes 'processing' then 'executing' and never
+                // 'running', so stamping only on "running" left StartedAt permanently null
+                // and broke every duration fallback that depended on it. Stamp on the first
+                // active status and never re-stamp.
+                if (status == "running" || status == "processing" || status == "executing")
                 {
                     var startedProp = entity.GetType().GetProperty("StartedAt");
                     if (startedProp != null)
                     {
-                        startedProp.SetValue(entity, DateTime.Now);
+                        var existing = startedProp.GetValue(entity);
+                        bool alreadyStamped = existing is DateTime stamped
+                            ? stamped != default(DateTime)
+                            : existing != null;
+
+                        if (!alreadyStamped)
+                        {
+                            startedProp.SetValue(entity, DateTime.Now);
+                        }
                     }
                 }
                 else if (status == "completed" || status == "failed" || status == "cancelled")

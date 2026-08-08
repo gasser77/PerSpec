@@ -200,6 +200,8 @@ class TestCoordinator:
         last_status = None
         consecutive_misses = 0
         request_created_at = None
+        pending_hint_shown = False
+        pending_hint_after = 15.0
 
         while time.time() - start_time < timeout:
             status = self.get_request_status(request_id)
@@ -224,6 +226,18 @@ class TestCoordinator:
             if status['status'] != last_status:
                 print(f"[STATUS] {status['status']}")
                 last_status = status['status']
+
+            # A request that Unity never picks up stays 'pending' in silence until the
+            # timeout expires. Say something actionable instead of nothing.
+            if (not pending_hint_shown
+                    and status['status'] == 'pending'
+                    and time.time() - start_time > pending_hint_after):
+                pending_hint_shown = True
+                print(f"[HINT] Unity has not picked up request {request_id} after "
+                      f"{pending_hint_after:.0f}s. The editor may be unfocused, compiling, "
+                      f"or PerSpec coordination may be disabled.")
+                print("[HINT] Check the Unity console for '[TestCoordinator]' lines, "
+                      "or run: quick_test.py stuck")
 
             if status['status'] in terminal_statuses:
                 self._await_results_xml(request_id, request_created_at, xml_grace_seconds)
@@ -381,55 +395,105 @@ class TestCoordinator:
     
     def cancel_request(self, request_id: int) -> bool:
         """
-        Cancel a pending or running test request
-        
+        Cancel a test request that has not reached a terminal state.
+
+        Covers every non-terminal status, not just pending/running: a request wedged
+        at 'processing', 'executing' or 'finalizing' is exactly the one a user needs
+        to clear, and it used to be uncancellable from Python.
+
         Args:
             request_id: ID of the test request
-            
+
         Returns:
             True if cancelled successfully
         """
         conn = self._get_connection()
         try:
             cursor = conn.cursor()
+
+            cursor.execute("SELECT status FROM test_requests WHERE id = ?", (request_id,))
+            row = cursor.fetchone()
+            if row is None:
+                print(f"[WARNING] Request {request_id} not found")
+                return False
+
+            previous_status = row['status']
+
             cursor.execute("""
-                UPDATE test_requests 
-                SET status = 'cancelled', 
+                UPDATE test_requests
+                SET status = 'cancelled',
                     completed_at = CURRENT_TIMESTAMP,
                     error_message = 'Cancelled by user'
-                WHERE id = ? AND status IN ('pending', 'running')
+                WHERE id = ? AND status IN (
+                    'pending', 'processing', 'executing', 'running', 'finalizing'
+                )
             """, (request_id,))
-            
+
             if cursor.rowcount > 0:
                 conn.commit()
-                print(f"[CANCELLED] Request {request_id} cancelled")
+                print(f"[CANCELLED] Request {request_id} cancelled (was '{previous_status}')")
                 return True
             else:
-                print(f"[WARNING] Request {request_id} cannot be cancelled (not pending/running)")
+                print(f"[WARNING] Request {request_id} is already terminal ('{previous_status}')")
                 return False
-                
+
         except sqlite3.Error as e:
             print(f"[ERROR] Error cancelling request: {e}")
             conn.rollback()
             return False
         finally:
             conn.close()
-    
+
     def get_pending_requests(self) -> List[Dict]:
         """Get all pending test requests"""
         conn = self._get_connection()
         try:
             cursor = conn.cursor()
             cursor.execute("""
-                SELECT * FROM test_requests 
+                SELECT * FROM test_requests
                 WHERE status = 'pending'
                 ORDER BY priority DESC, created_at ASC
             """)
-            
+
             return [dict(row) for row in cursor.fetchall()]
-            
+
         finally:
             conn.close()
+
+    def get_nonterminal_requests(self) -> List[Dict]:
+        """Get every request that has not reached a terminal state.
+
+        Unlike get_pending_requests this includes in-flight statuses, so a run that
+        Unity picked up but never finished is actually visible.
+        """
+        conn = self._get_connection()
+        try:
+            cursor = conn.cursor()
+            cursor.execute("""
+                SELECT * FROM test_requests
+                WHERE status NOT IN (
+                    'completed', 'failed', 'cancelled', 'timeout', 'inconclusive'
+                )
+                ORDER BY created_at ASC
+            """)
+
+            return [dict(row) for row in cursor.fetchall()]
+
+        finally:
+            conn.close()
+
+    def describe_age(self, created_at) -> str:
+        """Human-readable age of a request, tolerant of tick and text timestamps."""
+        parsed = self._parse_request_timestamp(created_at)
+        if parsed is None:
+            return "unknown age"
+
+        seconds = max(0.0, (datetime.now() - parsed).total_seconds())
+        if seconds < 60:
+            return f"{seconds:.0f}s old"
+        if seconds < 3600:
+            return f"{seconds / 60:.1f}m old"
+        return f"{seconds / 3600:.1f}h old"
     
     def get_execution_log(self, request_id: Optional[int] = None, limit: int = 100) -> List[Dict]:
         """
