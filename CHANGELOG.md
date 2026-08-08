@@ -5,6 +5,48 @@ All notable changes to the PerSpec Testing Framework will be documented in this 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.8.1] - 2026-08-07
+
+### Added
+- **Dependency preflight that explains a missing package instead of vanishing**
+  - Every PerSpec editor assembly depends on `com.gilzoide.sqlite-net`, directly or transitively
+    (`Initialization` -> `Services` -> `Coordination` -> `Gilzoide.SqliteNet`). When that package
+    fails to resolve, all of them fail to compile, the `Tools > PerSpec` menu disappears, and no
+    PerSpec code survives to say why. The user is left with a bare
+    `Package [com.gilzoide.sqlite-net@1.3.1] cannot be found` naming a package they never asked for.
+  - New `PerSpec.Editor.Preflight` assembly with **zero assembly references**, so it is the one
+    that still compiles when the rest of the package cannot. It must stay reference-free.
+  - On load it checks every dependency declared in `package.json` using the synchronous
+    `PackageInfo.GetAllRegisteredPackages()`. When all are present it logs nothing at all.
+  - When one is missing it logs a single error naming the package, what it is needed for, whether
+    the package comes from OpenUPM or the Unity registry, and whether `Packages/manifest.json` is
+    actually missing the scope or the download simply failed. Gated on `SessionState` so a domain
+    reload does not repeat it.
+- **`Tools > PerSpec > Repair Package Dependencies`**
+  - Registered in the preflight assembly, so it is reachable precisely when the rest of the menu is not.
+  - Copies a correct `scopedRegistries` block to the clipboard and offers to reveal
+    `manifest.json`. It does not edit the manifest itself: `UnityEditor.PackageManager.Client` has
+    no `AddScopedRegistry` in 6000.3, so an automated path would mean hand-merging JSON into the
+    one file that gates the entire project, and a bad merge there is far worse than one paste.
+  - Reads the manifest as raw text and scans only inside the `scopedRegistries` array, so a package
+    id listed under `dependencies` is not mistaken for a scope. No JSON library is used, because
+    `com.unity.nuget.newtonsoft-json` is itself on the list of things that may be missing.
+
+### Fixed
+- **Install instructions pointed at a repository that does not exist**
+  - `Documentation/quick-start.md` told users to
+    `git clone https://github.com/yourusername/perspec.git Packages/com.perspec.framework`.
+    Both the URL and the package name were wrong, and the scoped registry went unmentioned, so
+    anyone following it landed straight in the resolution failure above.
+  - Replaced with the OpenUPM CLI route plus a manual `manifest.json` block listing all three
+    required scopes.
+- **README recommended a version range Unity does not support**
+  - The manual install block used `"com.digitraver.perspec": "^1.5.0"` and claimed the range would
+    track 1.5.x and 1.6.x automatically. Unity's project manifest accepts exact versions only;
+    npm-style ranges are not supported there. Corrected to an exact version with a note explaining
+    the difference.
+  - Also documents why all three scopes are required and points at the new repair menu item.
+
 ## [1.8.0] - 2026-08-07
 
 ### Fixed

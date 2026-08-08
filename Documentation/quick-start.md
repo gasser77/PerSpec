@@ -4,10 +4,47 @@
 
 ### 1. Install Package
 
+PerSpec is published on [OpenUPM](https://openupm.com/packages/com.digitraver.perspec/). The CLI
+is the easiest route, because it adds the scoped registry and every required scope for you:
+
 ```bash
-# Clone to Packages folder
-git clone https://github.com/yourusername/perspec.git Packages/com.perspec.framework
+npm install -g openupm-cli
+openupm add com.digitraver.perspec
 ```
+
+<details>
+<summary><b>Manual installation (alternative)</b></summary>
+
+Add the following to `Packages/manifest.json`. **All three scopes are required.** PerSpec depends
+on `com.cysharp.unitask` and `com.gilzoide.sqlite-net`, which also come from OpenUPM. Leave either
+scope out and Unity asks the default Unity registry instead, which does not host them, and you get
+`Package [com.gilzoide.sqlite-net@1.3.1] cannot be found`.
+
+```json
+"scopedRegistries": [
+  {
+    "name": "package.openupm.com",
+    "url": "https://package.openupm.com",
+    "scopes": [
+      "com.digitraver.perspec",
+      "com.cysharp.unitask",
+      "com.gilzoide.sqlite-net"
+    ]
+  }
+],
+"dependencies": {
+  "com.digitraver.perspec": "1.8.1"
+}
+```
+
+> **Note:** Use an exact version. Unity's project manifest does not support npm-style version
+> ranges such as `^1.8.0`. To upgrade, change the number and let Unity re-resolve.
+
+</details>
+
+If a dependency ever fails to resolve, run `Tools > PerSpec > Repair Package Dependencies`. It
+reports exactly which package is missing and why, and stays available even when the rest of the
+PerSpec menu does not.
 
 ### 2. Initialize PerSpec
 
