@@ -40,6 +40,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     anyone following it landed straight in the resolution failure above.
   - Replaced with the OpenUPM CLI route plus a manual `manifest.json` block listing all three
     required scopes.
+- **Package version was hardcoded and had drifted five minor releases**
+  - `PerSpecInitializer.cs` carried `private const string CURRENT_VERSION = "1.3.1"` with the
+    comment "Should match package.json". It did not: the package was shipping 1.8.x.
+  - It was the fallback whenever `PackageInfo.FindForPackageName` returned null, so any failed
+    lookup pushed the recorded version backwards to 1.3.1. The next successful lookup then read
+    as a fresh upgrade and re-ran the entire update flow: re-copying Python scripts, rewriting LLM
+    configuration, and popping the update window for a package that had not changed.
+  - Replaced with a resolver that reads the version from the package itself, preferring
+    `PackageInfo.FindForAssembly` (which works for registry, embedded and local installs, and does
+    not depend on a package-name string staying in sync) and falling back to `FindForPackageName`.
+  - When neither can answer, it now reports `unknown` and skips the update check rather than
+    inventing a number, since storing a placeholder is what faked the upgrade in the first place.
+    The first-run setup window still appears when the project is uninitialized.
 - **README recommended a version range Unity does not support**
   - The manual install block used `"com.digitraver.perspec": "^1.5.0"` and claimed the range would
     track 1.5.x and 1.6.x automatically. Unity's project manifest accepts exact versions only;
