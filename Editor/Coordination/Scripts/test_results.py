@@ -25,43 +25,13 @@ def get_project_root():
         current = current.parent
     return Path.cwd()
 
+import results_verification as rv
+
+
 def get_test_results_path():
     """Get the primary TestResults directory path (PerSpec/TestResults/)."""
     project_root = get_project_root()
     return project_root / "PerSpec" / "TestResults"
-
-
-def _appdata_unity_candidates():
-    """Mirror C# TestExecutor.cs:602-616 AppData fallback enumeration.
-
-    Returns directories under %LocalAppData%Low that contain a TestResults.xml.
-    Each is a candidate source for the Unity-default results XML.
-    """
-    local_app = os.environ.get("LOCALAPPDATA")
-    if not local_app:
-        return []
-    appdata_low = Path(local_app + "Low")
-    if not appdata_low.exists():
-        return []
-
-    project_name = get_project_root().name
-    preferred = {project_name, "TestFramework"}
-    candidates = []
-    try:
-        for company_dir in appdata_low.iterdir():
-            if not company_dir.is_dir():
-                continue
-            for product_dir in company_dir.iterdir():
-                if not product_dir.is_dir():
-                    continue
-                if (product_dir / "TestResults.xml").exists():
-                    score = (2 if product_dir.name in preferred else 0) + \
-                            (1 if company_dir.name == "DefaultCompany" else 0)
-                    candidates.append((score, product_dir))
-    except OSError:
-        return []
-    candidates.sort(key=lambda t: t[0], reverse=True)
-    return [c for _, c in candidates]
 
 
 def _import_appdata_xml_into_perspec(source_xml: Path, dest_dir: Path) -> Optional[Path]:
@@ -77,6 +47,7 @@ def _import_appdata_xml_into_perspec(source_xml: Path, dest_dir: Path) -> Option
     except OSError as e:
         print(f"[WARN] Failed to import {source_xml}: {e}")
         return None
+
 
 def parse_xml_file(xml_path: Path) -> Dict:
     """Parse a test results XML file"""
@@ -125,13 +96,20 @@ def parse_xml_file(xml_path: Path) -> Dict:
             'timestamp': datetime.fromtimestamp(xml_path.stat().st_mtime).strftime('%Y-%m-%d %H:%M:%S')
         }
 
-def list_result_files(limit: int = 10) -> List[Path]:
-    """List available test result files.
+def list_result_files(limit: int = 10, max_age_hours=None) -> List[Path]:
+    """List available test result files, newest first.
 
-    Looks in PerSpec/TestResults/ first. If empty (or if Unity's AppData copy
-    is newer than anything we have), imports the AppData TestResults.xml into
-    PerSpec/TestResults/ first so subsequent reads are consistent.
+    Looks in PerSpec/TestResults/ first. If Unity's own AppData copy is newer than
+    anything we have, it is imported so subsequent reads are consistent - but only if it
+    is recent enough to plausibly be the current run.
+
+    The age guard matters because the coordinator trims PerSpec/TestResults, so "newer
+    than anything local" can be true of an arbitrarily old file. That is how a six-day-old
+    green run came to be printed as the current result.
     """
+    if max_age_hours is None:
+        max_age_hours = rv.DEFAULT_MAX_AGE_HOURS
+
     results_path = get_test_results_path()
     results_path.mkdir(parents=True, exist_ok=True)
 
@@ -141,14 +119,23 @@ def list_result_files(limit: int = 10) -> List[Path]:
         default=0.0,
     )
 
-    # If AppData has a newer TestResults.xml than anything in PerSpec, import it.
-    for appdata_dir in _appdata_unity_candidates():
+    max_age_seconds = None if max_age_hours <= 0 else max_age_hours * 3600.0
+
+    for appdata_dir in rv.unity_appdata_candidates():
         source = appdata_dir / "TestResults.xml"
-        if source.exists() and source.stat().st_mtime > perspec_latest_mtime:
-            imported = _import_appdata_xml_into_perspec(source, results_path)
-            if imported is not None:
-                perspec_xmls.append(imported)
-                break  # only import from the highest-priority candidate
+        if not source.exists() or source.stat().st_mtime <= perspec_latest_mtime:
+            continue
+
+        age = rv.file_age_seconds(source)
+        if max_age_seconds is not None and age > max_age_seconds:
+            print(f"[WARN] Not importing {source}: it is {rv.format_age(age)} old, "
+                  f"far older than the current run. Use --allow-stale to import it anyway.")
+            break
+
+        imported = _import_appdata_xml_into_perspec(source, results_path)
+        if imported is not None:
+            perspec_xmls.append(imported)
+        break  # only consider the highest-priority candidate
 
     xml_files = sorted(
         perspec_xmls,
@@ -157,6 +144,21 @@ def list_result_files(limit: int = 10) -> List[Path]:
     )
 
     return xml_files[:limit] if limit > 0 else xml_files
+
+
+def warn_if_stale(xml_path: Path, warn_after_seconds: float = 3600.0):
+    """Print the result's age, loudly when it is old enough to be from a previous session."""
+    try:
+        age = rv.file_age_seconds(xml_path)
+    except OSError:
+        return
+
+    if age > warn_after_seconds:
+        print(f"\n[WARN] These results are {rv.format_age(age)} old - they are almost "
+              f"certainly NOT from a run you just started.")
+    else:
+        print(f"\nAge: {rv.format_age(age)}")
+
 
 def display_summary(data: Dict, verbose: bool = False):
     """Display test results summary"""
@@ -219,10 +221,19 @@ def main():
     latest_parser = subparsers.add_parser('latest', help='Show latest test results')
     latest_parser.add_argument('-v', '--verbose', action='store_true', help='Show detailed output')
     latest_parser.add_argument('--json', action='store_true', help='Output as JSON')
+    latest_parser.add_argument('--max-age', type=float, default=None,
+                               help='Refuse to import Unity results older than N hours '
+                                    f'(default: {rv.DEFAULT_MAX_AGE_HOURS:.0f})')
+    latest_parser.add_argument('--allow-stale', action='store_true',
+                               help='Import Unity results no matter how old they are')
     
     # List command
     list_parser = subparsers.add_parser('list', help='List available test result files')
     list_parser.add_argument('-n', '--number', type=int, default=10, help='Number of files to list')
+    list_parser.add_argument('--max-age', type=float, default=None,
+                             help='Refuse to import Unity results older than N hours')
+    list_parser.add_argument('--allow-stale', action='store_true',
+                             help='Import Unity results no matter how old they are')
     
     # Show command (specific file)
     show_parser = subparsers.add_parser('show', help='Show specific test result file')
@@ -251,21 +262,27 @@ def main():
         args.command = 'latest'
         args.verbose = False
         args.json = False
+        args.max_age = None
+        args.allow_stale = False
+
+    # 0 disables the age guard entirely.
+    max_age = 0.0 if getattr(args, 'allow_stale', False) else getattr(args, 'max_age', None)
     
     # Execute commands
     if args.command == 'latest':
-        files = list_result_files(1)
+        files = list_result_files(1, max_age)
         if files:
             data = parse_xml_file(files[0])
             if args.json:
                 print(json.dumps(data, indent=2, default=str))
             else:
                 display_summary(data, args.verbose)
+                warn_if_stale(files[0])
         else:
             print("No test result files found")
     
     elif args.command == 'list':
-        files = list_result_files(args.number)
+        files = list_result_files(args.number, max_age)
         if files:
             print(f"\nFound {len(files)} test result files:")
             print("-" * 60)

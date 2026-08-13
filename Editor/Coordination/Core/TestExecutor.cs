@@ -3,7 +3,6 @@ using System.Collections.Generic;
 using System.Linq;
 using System.IO;
 using System.Xml.Linq;
-using System.Text.RegularExpressions;
 using UnityEngine;
 using UnityEditor;
 using UnityEngine.TestTools;
@@ -46,6 +45,11 @@ namespace PerSpec.Editor.Coordination
         private long _lastFileSize;
         private double _fileStableTime;
         private DateTime _monitorStartDateTime;
+
+        // Remembers the last results file that failed content verification, so the 2-second
+        // poll logs each rejection once and the eventual timeout can explain what it saw.
+        private string _lastRejectedFile;
+        private string _lastRejectionReason;
         
         public TestExecutor(SQLiteManager dbManager)
         {
@@ -101,7 +105,9 @@ namespace PerSpec.Editor.Coordination
             _testsStarted = false;
             _testsCompleted = 0;
             _expectedTestCount = 0;
-            
+            _lastRejectedFile = null;
+            _lastRejectionReason = null;
+
             try
             {
                 // Start file monitoring before test execution
@@ -268,18 +274,37 @@ namespace PerSpec.Editor.Coordination
                             $"Error persisting results: {persistEx.Message}");
                     }
 
-                    // Now mark as fully completed
-                    _dbManager.UpdateRequestStatus(_currentRequest.Id, "completed");
-                    _dbManager.LogExecution(_currentRequest.Id, "INFO", "TestExecutor", 
-                        $"Test execution completed: {_currentSummary.PassedTests}/{_currentSummary.TotalTests} passed");
-                    
-                    Debug.Log($"[TestExecutor] Test results - Passed: {_currentSummary.PassedTests}, " +
-                             $"Failed: {_currentSummary.FailedTests}, Skipped: {_currentSummary.SkippedTests}");
-                    
-                    // Notify completion
-                    if (_onComplete != null)
+                    // The callback results are the most trustworthy source we have - Unity
+                    // handed them to us for this run. Even so, confirm they belong to the
+                    // filter that was asked for. A run that executed nothing matching its
+                    // filter must be inconclusive, never a green completion.
+                    string mismatchReason = DescribeFilterMismatch();
+                    if (mismatchReason != null)
                     {
-                        _onComplete(_currentRequest, true, null, _currentSummary);
+                        _dbManager.UpdateRequestStatus(_currentRequest.Id, "inconclusive", mismatchReason);
+                        _dbManager.LogExecution(_currentRequest.Id, "WARNING", "TestExecutor", mismatchReason);
+                        Debug.LogWarning($"[TestExecutor] {mismatchReason}");
+
+                        if (_onComplete != null)
+                        {
+                            _onComplete(_currentRequest, false, mismatchReason, _currentSummary);
+                        }
+                    }
+                    else
+                    {
+                        // Now mark as fully completed
+                        _dbManager.UpdateRequestStatus(_currentRequest.Id, "completed");
+                        _dbManager.LogExecution(_currentRequest.Id, "INFO", "TestExecutor",
+                            $"Test execution completed: {_currentSummary.PassedTests}/{_currentSummary.TotalTests} passed");
+
+                        Debug.Log($"[TestExecutor] Test results - Passed: {_currentSummary.PassedTests}, " +
+                                 $"Failed: {_currentSummary.FailedTests}, Skipped: {_currentSummary.SkippedTests}");
+
+                        // Notify completion
+                        if (_onComplete != null)
+                        {
+                            _onComplete(_currentRequest, true, null, _currentSummary);
+                        }
                     }
                 }
                 
@@ -367,6 +392,50 @@ namespace PerSpec.Editor.Coordination
             }
         }
         
+        /// <summary>
+        /// Checks the in-memory callback results against the request's filter.
+        /// Returns null when they agree, otherwise an explanation suitable for error_message.
+        ///
+        /// This catches the case Unity itself cannot: a filter that resolves to zero tests
+        /// still produces a clean, empty, "successful" run.
+        /// </summary>
+        private string DescribeFilterMismatch()
+        {
+            if (_currentRequest == null)
+            {
+                return null;
+            }
+
+            string requestType = _currentRequest.RequestType ?? "all";
+            string filter = _currentRequest.TestFilter;
+
+            if (_testResults.Count == 0)
+            {
+                string target = string.IsNullOrEmpty(filter) ? "the requested tests" : $"'{filter}'";
+                return $"Test run finished without executing any tests for {target}. " +
+                       "Check the filter is a fully qualified name and that the assembly compiled.";
+            }
+
+            // Categories are not visible on the result nodes, and 'all' matches by definition.
+            if (requestType == "category" || requestType == "all" || string.IsNullOrEmpty(filter))
+            {
+                return null;
+            }
+
+            int matched = _testResults.Keys.Count(
+                fullName => TestResultVerifier.IsMatch(fullName, requestType, filter));
+
+            if (matched > 0)
+            {
+                return null;
+            }
+
+            string sample = string.Join(", ", _testResults.Keys.Take(3));
+            return $"Test run executed {_testResults.Count} test(s), none of which match " +
+                   $"{requestType} filter '{filter}'. Executed: {sample}" +
+                   (_testResults.Count > 3 ? ", ..." : string.Empty);
+        }
+
         private void ProcessTestResults(ITestResultAdaptor result)
         {
             // Reset counters
@@ -636,9 +705,12 @@ namespace PerSpec.Editor.Coordination
                 // Use _monitorStartDateTime for freshness check (set at START of monitoring)
                 // For initial snapshot: no buffer (capture state at monitoring start)
                 // For monitoring: allow 5 second backward buffer for clock skew
+                // If the monitor start time is unknown we cannot tell this run's output from
+                // the previous run's, so adopt nothing. A wall-clock window was the old
+                // fallback and it was wide enough to swallow the previous run's results.
                 DateTime cutoffTime = _monitorStartDateTime != default
                     ? (forInitialSnapshot ? _monitorStartDateTime : _monitorStartDateTime.AddSeconds(-5))
-                    : DateTime.Now.AddMinutes(-5);  // Fallback: only use files from last 5 minutes
+                    : DateTime.MaxValue;
 
                 Debug.Log($"[TestExecutor-FM-DEBUG] PerSpec/TestResults cutoff: {cutoffTime:O}");
 
@@ -652,17 +724,25 @@ namespace PerSpec.Editor.Coordination
                     Debug.Log($"[TestExecutor-FM-DEBUG]   File: {Path.GetFileName(f)}, Written: {fi.LastWriteTime:O}, PassesFreshness: {passesFilter}");
                 }
 
-                var xmlFiles = allXmlFiles
+                var freshFiles = allXmlFiles
                     .Select(f => new FileInfo(f))
                     .Where(fi => fi.LastWriteTime >= cutoffTime)
                     .OrderByDescending(fi => fi.LastWriteTime)
                     .Select(fi => fi.FullName)
-                    .FirstOrDefault();
+                    .ToList();
 
-                if (!string.IsNullOrEmpty(xmlFiles))
+                // Prefer a file whose contents belong to this request, so a leftover from a
+                // different run cannot mask a good file sitting behind it. When none qualifies,
+                // still hand back the newest so the caller logs a specific rejection reason.
+                string chosen = forInitialSnapshot
+                    ? freshFiles.FirstOrDefault()
+                    : (TestResultVerifier.PickBest(freshFiles, _currentRequest, false, out _)
+                       ?? freshFiles.FirstOrDefault());
+
+                if (!string.IsNullOrEmpty(chosen))
                 {
-                    Debug.Log($"[TestExecutor-FM-DEBUG] RETURNING PerSpec file: {xmlFiles}");
-                    return xmlFiles;
+                    Debug.Log($"[TestExecutor-FM-DEBUG] RETURNING PerSpec file: {chosen}");
+                    return chosen;
                 }
                 else
                 {
@@ -695,7 +775,7 @@ namespace PerSpec.Editor.Coordination
                     // For monitoring: allow 5 second backward buffer for clock skew
                     DateTime cutoffTime = _monitorStartDateTime != default
                         ? (forInitialSnapshot ? _monitorStartDateTime : _monitorStartDateTime.AddSeconds(-5))
-                        : DateTime.Now.AddMinutes(-5);  // Fallback: only use files from last 5 minutes
+                        : DateTime.MaxValue;  // Unknown start time -> adopt nothing
 
                     Debug.Log($"[TestExecutor-FM-DEBUG] === AppData Check ===");
                     var sourceInfo = new FileInfo(testResultFile);
@@ -710,6 +790,20 @@ namespace PerSpec.Editor.Coordination
                                   $"file written {sourceInfo.LastWriteTime:s}, " +
                                   $"cutoff time {cutoffTime:s}");
                         continue;
+                    }
+
+                    // Fresh is not the same as ours. Importing a foreign XML into
+                    // PerSpec/TestResults leaves a decoy behind that every later recovery
+                    // path can pick up, so check the contents before copying anything.
+                    if (!forInitialSnapshot)
+                    {
+                        var appDataVerification = TestResultVerifier.Verify(testResultFile, _currentRequest);
+                        if (!appDataVerification.CanAdopt)
+                        {
+                            _lastRejectionReason = appDataVerification.Reason;
+                            TestResultVerifier.LogRejection("TestExecutor-FM", appDataVerification);
+                            continue;
+                        }
                     }
 
                     // Copy to PerSpec/TestResults for consistency
@@ -796,17 +890,35 @@ namespace PerSpec.Editor.Coordination
                     }
                 }
 
-                // Look for corresponding summary file
-                string summaryPath = xmlPath.Replace(".xml", ".summary.txt");
+                // Timestamps alone cannot tell one run's output from another's, which is how a
+                // request for class B ended up reporting class A's results. Confirm the file's
+                // contents actually belong to this request before adopting anything from it.
+                var verification = TestResultVerifier.Verify(xmlPath, _currentRequest);
 
-                if (File.Exists(summaryPath))
+                // Unity is known to emit a completely empty XML for some single-method runs.
+                // That case has its own inconclusive handling below, so let it through.
+                bool emptyMethodRun = verification.Match == TestResultMatch.Empty
+                                      && _currentRequest?.RequestType == "method";
+
+                if (!verification.CanAdopt && !emptyMethodRun)
                 {
-                    ParseSummaryFile(summaryPath);
+                    if (xmlPath != _lastRejectedFile)
+                    {
+                        _lastRejectedFile = xmlPath;
+                        _lastRejectionReason = verification.Reason;
+                        TestResultVerifier.LogRejection("TestExecutor-FM", verification);
+
+                        if (_currentRequest != null)
+                        {
+                            _dbManager.LogExecution(_currentRequest.Id, "WARNING", "TestExecutor", verification.Reason);
+                        }
+                    }
+
+                    // Keep monitoring. The run may still be live and about to write its own file.
+                    return;
                 }
-                else if (File.Exists(xmlPath))
-                {
-                    ParseXmlFile(xmlPath);
-                }
+
+                ApplyVerifiedResults(verification);
 
                 // Validate results match expectations
                 if (_expectedTestCount > 0 && _currentSummary.TotalTests != _expectedTestCount)
@@ -825,16 +937,31 @@ namespace PerSpec.Editor.Coordination
 
                 if (_currentRequest != null && _onComplete != null && !_hasCompletedViaCallback)
                 {
-                    // Choose terminal status: 'inconclusive' when a method-level run produced
-                    // no meaningful results (everything skipped); 'completed' otherwise.
+                    // Choose terminal status. 'completed' has to mean "these results are this
+                    // request's results", so anything short of that is 'inconclusive'.
                     string terminalStatus = "completed";
+                    string terminalReason = null;
+
                     if (_currentRequest.RequestType == "method"
                         && _currentSummary.TotalTests > 0
                         && _currentSummary.PassedTests == 0
                         && _currentSummary.FailedTests == 0
                         && _currentSummary.SkippedTests == _currentSummary.TotalTests)
                     {
+                        // A method-level run where everything was skipped proves nothing.
                         terminalStatus = "inconclusive";
+                        terminalReason = "Every test in this method-level run was skipped";
+                    }
+                    else if (verification.IsSynthetic)
+                    {
+                        // A generated placeholder file, not the record of a real run.
+                        terminalStatus = "inconclusive";
+                        terminalReason = "Results came from a generated placeholder XML, not an actual test run";
+                    }
+                    else if (verification.Match == TestResultMatch.Unverifiable)
+                    {
+                        // Category runs are accepted on timestamp alone - say so in the row.
+                        terminalReason = verification.Reason;
                     }
 
                     // Update status to finalizing
@@ -857,7 +984,8 @@ namespace PerSpec.Editor.Coordination
                         _currentSummary.PassedTests,
                         _currentSummary.FailedTests,
                         _currentSummary.SkippedTests,
-                        duration
+                        duration,
+                        terminalReason
                     );
                     _dbManager.LogExecution(_currentRequest.Id, "INFO", "TestExecutor",
                         $"Test execution {terminalStatus} via file monitoring: {_currentSummary.PassedTests}/{_currentSummary.TotalTests} passed");
@@ -906,11 +1034,18 @@ namespace PerSpec.Editor.Coordination
                 // result file newer than this run's start? If so we're done.
                 DateTime cutoff = _monitorStartDateTime != default
                     ? _monitorStartDateTime.AddSeconds(-5)
-                    : DateTime.Now.AddMinutes(-5);
-                bool freshExists = Directory.GetFiles(_testResultsPath, "TestResults_*.xml")
+                    : DateTime.MaxValue;  // Unknown start time -> import nothing
+
+                // "Fresh" is not enough here: a foreign fresh file would satisfy this check
+                // and suppress the import of the run's real results. It has to be a file that
+                // actually belongs to this request.
+                bool verifiedFreshExists = Directory.GetFiles(_testResultsPath, "TestResults_*.xml")
                     .Select(f => new FileInfo(f))
-                    .Any(fi => fi.LastWriteTime >= cutoff);
-                if (freshExists)
+                    .Where(fi => fi.LastWriteTime >= cutoff)
+                    .OrderByDescending(fi => fi.LastWriteTime)
+                    .Any(fi => TestResultVerifier.Verify(fi.FullName, _currentRequest).CanAdoptAsLastResort);
+
+                if (verifiedFreshExists)
                 {
                     return;
                 }
@@ -921,6 +1056,13 @@ namespace PerSpec.Editor.Coordination
                     if (!File.Exists(source)) continue;
                     var sourceInfo = new FileInfo(source);
                     if (sourceInfo.LastWriteTime < cutoff) continue;
+
+                    var verification = TestResultVerifier.Verify(source, _currentRequest);
+                    if (!verification.CanAdoptAsLastResort)
+                    {
+                        TestResultVerifier.LogRejection("TestExecutor", verification);
+                        continue;
+                    }
 
                     string timestamp = sourceInfo.LastWriteTime.ToString("yyyyMMdd_HHmmss");
                     string dest = Path.Combine(_testResultsPath, $"TestResults_{timestamp}.xml");
@@ -977,101 +1119,54 @@ namespace PerSpec.Editor.Coordination
             }
         }
         
-        private void ParseSummaryFile(string summaryPath)
+        /// <summary>
+        /// Copies verified results into the current summary.
+        ///
+        /// Counts come from the matching &lt;test-case&gt; leaves, never from the root attributes.
+        /// Those attributes were double-counted by every PerSpec before 1.9.0 (an 18-test run
+        /// exported passed="44"), and the .summary.txt beside the XML carries the same wrong
+        /// numbers with no test names to verify them against - so it is no longer read here.
+        /// </summary>
+        private void ApplyVerifiedResults(TestResultVerification verification)
         {
-            var lines = File.ReadAllLines(summaryPath);
-            
-            foreach (var line in lines)
+            _currentSummary.TotalTests = verification.MatchedCases;
+            _currentSummary.PassedTests = verification.Passed;
+            _currentSummary.FailedTests = verification.Failed;
+            _currentSummary.SkippedTests = verification.Skipped + verification.Inconclusive;
+
+            if (verification.Duration > 0f)
             {
-                if (line.Contains("Total Tests:"))
-                {
-                    if (int.TryParse(Regex.Match(line, @"\d+").Value, out int totalTests))
-                        _currentSummary.TotalTests = totalTests;
-                }
-                else if (line.Contains("Passed:"))
-                {
-                    if (int.TryParse(Regex.Match(line, @"\d+").Value, out int passedTests))
-                        _currentSummary.PassedTests = passedTests;
-                }
-                else if (line.Contains("Failed:"))
-                {
-                    if (int.TryParse(Regex.Match(line, @"\d+").Value, out int failedTests))
-                        _currentSummary.FailedTests = failedTests;
-                }
-                else if (line.Contains("Skipped:"))
-                {
-                    if (int.TryParse(Regex.Match(line, @"\d+").Value, out int skippedTests))
-                        _currentSummary.SkippedTests = skippedTests;
-                }
-                else if (line.Contains("Duration:"))
-                {
-                    var match = Regex.Match(line, @"[\d.]+");
-                    if (match.Success)
-                    {
-                        if (float.TryParse(match.Value, out float duration))
-                            _currentSummary.Duration = duration;
-                    }
-                }
+                _currentSummary.Duration = verification.Duration;
             }
-            
-            Debug.Log($"[TestExecutor] Parsed summary - Total: {_currentSummary.TotalTests}, " +
-                     $"Passed: {_currentSummary.PassedTests}, Failed: {_currentSummary.FailedTests}");
-        }
-        
-        private void ParseXmlFile(string xmlPath)
-        {
-            try
+
+            // Unity sometimes produces an empty XML for a single-method run. Write the
+            // placeholder the viewer expects and report the run as inconclusive - it is not
+            // evidence the test passed.
+            if (verification.TotalCases == 0 && _currentRequest != null && _currentRequest.RequestType == "method")
             {
-                var doc = XDocument.Load(xmlPath);
-                var testRun = doc.Root;
-                
-                if (testRun != null)
+                Debug.LogWarning($"[TestExecutor] Empty XML for individual test method - generating placeholder XML");
+
+                try
                 {
-                    _currentSummary.TotalTests = int.Parse(testRun.Attribute("total")?.Value ?? "0");
-                    _currentSummary.PassedTests = int.Parse(testRun.Attribute("passed")?.Value ?? "0");
-                    _currentSummary.FailedTests = int.Parse(testRun.Attribute("failed")?.Value ?? "0");
-                    _currentSummary.SkippedTests = int.Parse(testRun.Attribute("skipped")?.Value ?? "0");
-                    
-                    var duration = testRun.Attribute("duration")?.Value;
-                    if (!string.IsNullOrEmpty(duration))
-                    {
-                        if (float.TryParse(duration, out float durationValue))
-                            _currentSummary.Duration = durationValue;
-                    }
-                    
-                    // Check for empty results from individual test execution
-                    if (_currentSummary.TotalTests == 0 && _currentRequest != null && _currentRequest.RequestType == "method")
-                    {
-                        Debug.LogWarning($"[TestExecutor] Empty XML for individual test method - generating proper XML");
-                        
-                        // Generate a proper XML file for the individual test
-                        try
-                        {
-                            string generatedXmlPath = TestExport.SingleTestXMLGenerator.GenerateInconclusiveTestXML(
-                                _currentRequest.TestFilter,
-                                _currentRequest.TestPlatform
-                            );
-                            
-                            Debug.Log($"[TestExecutor] Generated proper XML for individual test at: {generatedXmlPath}");
-                        }
-                        catch (Exception ex)
-                        {
-                            Debug.LogError($"[TestExecutor] Failed to generate XML: {ex.Message}");
-                        }
-                        
-                        // Set minimal results to indicate the test ran but results are unavailable
-                        _currentSummary.TotalTests = 1;
-                        _currentSummary.SkippedTests = 1;  // Mark as inconclusive
-                    }
+                    string generatedXmlPath = TestExport.SingleTestXMLGenerator.GenerateInconclusiveTestXML(
+                        _currentRequest.TestFilter,
+                        _currentRequest.TestPlatform
+                    );
+
+                    Debug.Log($"[TestExecutor] Generated placeholder XML for individual test at: {generatedXmlPath}");
                 }
-                
-                Debug.Log($"[TestExecutor] Parsed XML - Total: {_currentSummary.TotalTests}, " +
-                         $"Passed: {_currentSummary.PassedTests}, Failed: {_currentSummary.FailedTests}");
+                catch (Exception ex)
+                {
+                    Debug.LogError($"[TestExecutor] Failed to generate XML: {ex.Message}");
+                }
+
+                _currentSummary.TotalTests = 1;
+                _currentSummary.SkippedTests = 1;  // Drives the 'inconclusive' terminal status
             }
-            catch (Exception e)
-            {
-                Debug.LogError($"[TestExecutor] Error parsing XML: {e.Message}");
-            }
+
+            Debug.Log($"[TestExecutor] Verified results - Total: {_currentSummary.TotalTests}, " +
+                     $"Passed: {_currentSummary.PassedTests}, Failed: {_currentSummary.FailedTests} " +
+                     $"({verification.Reason})");
         }
         
         private void HandleTestTimeout()
@@ -1108,6 +1203,15 @@ namespace PerSpec.Editor.Coordination
                     }
                 }
                 
+                string timeoutMessage = $"Test execution timed out after {timeoutValue} seconds";
+
+                // A timeout that happened because every results file we saw belonged to a
+                // different run is a very different problem from a hung test. Say which it was.
+                if (!string.IsNullOrEmpty(_lastRejectionReason))
+                {
+                    timeoutMessage += $". Results files were seen but none belonged to this request: {_lastRejectionReason}";
+                }
+
                 // Update database with timeout status
                 _dbManager.UpdateRequestResults(
                     _currentRequest.Id,
@@ -1116,16 +1220,16 @@ namespace PerSpec.Editor.Coordination
                     0,          // No passed tests
                     1,          // Mark as failed due to timeout
                     0,          // No skipped tests
-                    (float)timeoutValue
+                    (float)timeoutValue,
+                    timeoutMessage
                 );
-                
-                _dbManager.LogExecution(_currentRequest.Id, "ERROR", "TestExecutor",
-                    $"Test execution timed out after {timeoutValue} seconds");
+
+                _dbManager.LogExecution(_currentRequest.Id, "ERROR", "TestExecutor", timeoutMessage);
 
                 var timedOutRequest = _currentRequest;
                 var notify = _onComplete;
 
-                notify(timedOutRequest, false, $"Test execution timed out after {timeoutValue} seconds", null);
+                notify(timedOutRequest, false, timeoutMessage, null);
 
                 // Release the TestRunnerApi callbacks - nothing else will do it on this path.
                 Cleanup();

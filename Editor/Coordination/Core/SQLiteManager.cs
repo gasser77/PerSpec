@@ -433,13 +433,18 @@ namespace PerSpec.Editor.Coordination
             }
         }
         
-        public void UpdateRequestResults(int requestId, string status, int totalTests, int passedTests, 
-                                        int failedTests, int skippedTests, float duration)
+        /// <param name="errorMessage">
+        /// Optional explanation stored alongside the counts. Needed because a run can now finish
+        /// with results that do not match its filter - the counts alone cannot say why.
+        /// </param>
+        public void UpdateRequestResults(int requestId, string status, int totalTests, int passedTests,
+                                        int failedTests, int skippedTests, float duration,
+                                        string errorMessage = null)
         {
             try
             {
                 var request = _connection.Table<TestRequest>().FirstOrDefault(r => r.Id == requestId);
-                
+
                 if (request != null)
                 {
                     request.Status = status;
@@ -449,7 +454,12 @@ namespace PerSpec.Editor.Coordination
                     request.FailedTests = failedTests;
                     request.SkippedTests = skippedTests;
                     request.DurationSeconds = duration;
-                    
+
+                    if (!string.IsNullOrEmpty(errorMessage))
+                    {
+                        request.ErrorMessage = errorMessage;
+                    }
+
                     _connection.Update(request);
                 }
             }

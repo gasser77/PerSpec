@@ -18,6 +18,16 @@ from pathlib import Path
 from typing import Optional, Dict, List, Tuple
 from enum import Enum
 
+import results_verification as rv
+
+class UnityNotRespondingError(RuntimeError):
+    """The Unity Editor stopped checking in while a request was still in flight.
+
+    Raised instead of waiting out the full timeout, which is what used to happen when a
+    request was submitted while the editor was restarting or importing assets.
+    """
+
+
 class TestPlatform(Enum):
     EDIT_MODE = "EditMode"
     PLAY_MODE = "PlayMode"
@@ -171,7 +181,9 @@ class TestCoordinator:
     
     def wait_for_completion(self, request_id: int, timeout: int = 300, poll_interval: float = 1.0,
                             xml_grace_seconds: float = 15.0,
-                            missing_row_retries: int = 10) -> Dict:
+                            missing_row_retries: int = 10,
+                            unity_dead_grace_seconds: float = 45.0,
+                            unity_heartbeat_max_age: float = 30.0) -> Dict:
         """
         Wait for a test request to fully complete.
 
@@ -191,9 +203,16 @@ class TestCoordinator:
             poll_interval: Seconds between status checks
             xml_grace_seconds: After terminal status, seconds to wait for XML
             missing_row_retries: Consecutive "not found" reads tolerated
+            unity_dead_grace_seconds: Give up after the editor has been silent this long
+            unity_heartbeat_max_age: Heartbeat older than this counts as "not checked in"
 
         Returns:
-            Final status dictionary
+            Final status dictionary, with a 'results_xml' key naming the file the run
+            was attributed to (or None).
+
+        Raises:
+            UnityNotRespondingError: the editor stopped checking in mid-flight
+            TimeoutError: the run did not finish within ``timeout``
         """
         terminal_statuses = {'completed', 'failed', 'cancelled', 'timeout', 'inconclusive'}
         start_time = time.time()
@@ -202,6 +221,7 @@ class TestCoordinator:
         request_created_at = None
         pending_hint_shown = False
         pending_hint_after = 15.0
+        unity_silent_since = None
 
         while time.time() - start_time < timeout:
             status = self.get_request_status(request_id)
@@ -239,8 +259,35 @@ class TestCoordinator:
                 print("[HINT] Check the Unity console for '[TestCoordinator]' lines, "
                       "or run: quick_test.py stuck")
 
+            # A restarting or closed editor cannot make progress on this request. Detect
+            # it from the heartbeat instead of waiting out the whole timeout.
+            #
+            # Only while the request is still 'pending'. Once Unity has picked it up, the
+            # editor has demonstrably seen it, and the heartbeat legitimately stalls during
+            # play mode and long imports - aborting then would kill healthy runs.
+            heartbeat_age = (self.seconds_since_unity_heartbeat()
+                             if status['status'] == 'pending' else 0.0)
+
+            if heartbeat_age is None or heartbeat_age > unity_heartbeat_max_age:
+                if unity_silent_since is None:
+                    unity_silent_since = time.time()
+                elif time.time() - unity_silent_since > unity_dead_grace_seconds:
+                    silent_for = ("no heartbeat has ever been recorded"
+                                  if heartbeat_age is None
+                                  else f"its last heartbeat was {heartbeat_age:.0f}s ago")
+                    raise UnityNotRespondingError(
+                        f"Unity Editor is not responding - {silent_for}. "
+                        f"It may be restarting, importing assets, or closed. "
+                        f"Request {request_id} is still {status['status']}."
+                    )
+            else:
+                unity_silent_since = None
+
             if status['status'] in terminal_statuses:
-                self._await_results_xml(request_id, request_created_at, xml_grace_seconds)
+                # Carry the results file out with the status so callers can check that
+                # what ran is what was asked for, rather than trusting the row alone.
+                status['results_xml'] = self._await_results_xml(
+                    request_id, request_created_at, xml_grace_seconds, start_time)
                 return status
 
             time.sleep(poll_interval)
@@ -248,12 +295,14 @@ class TestCoordinator:
         raise TimeoutError(f"Request {request_id} did not complete within {timeout} seconds")
 
     def _await_results_xml(self, request_id: int, request_created_at,
-                           xml_grace_seconds: float):
+                           xml_grace_seconds: float, wait_started_at: float = None):
         """After terminal status, ensure a fresh results XML exists in PerSpec/TestResults.
 
-        Polls PerSpec/TestResults for an XML newer than the request's creation
-        time. If none appears within ``xml_grace_seconds``, attempts a one-shot
-        copy from Unity's AppData fallback locations.
+        Polls PerSpec/TestResults for an XML newer than the request's creation time. If
+        none appears within ``xml_grace_seconds``, attempts a one-shot copy from Unity's
+        AppData fallback locations.
+
+        Returns the path of the XML attributed to this run, or None.
         """
         try:
             from datetime import datetime, timedelta
@@ -269,6 +318,13 @@ class TestCoordinator:
                 if cutoff is not None:
                     cutoff -= timedelta(seconds=5)
 
+            # With no usable created_at, fall back to "written since we started waiting".
+            # Accepting any XML at all - which is what this used to do - is how a previous
+            # run's results got reported as this one's.
+            if cutoff is None:
+                base = wait_started_at if wait_started_at is not None else time.time()
+                cutoff = datetime.fromtimestamp(base) - timedelta(seconds=5)
+
             def _matching_xml():
                 xmls = sorted(
                     results_dir.glob("TestResults_*.xml"),
@@ -276,42 +332,43 @@ class TestCoordinator:
                     reverse=True,
                 )
                 for xml in xmls:
-                    if cutoff is None:
-                        return xml
                     if datetime.fromtimestamp(xml.stat().st_mtime) >= cutoff:
                         return xml
                 return None
 
             deadline = time.time() + xml_grace_seconds
             while time.time() < deadline:
-                if _matching_xml():
-                    return
+                found = _matching_xml()
+                if found:
+                    return found
                 time.sleep(1.0)
 
             # Fallback: copy from Unity's AppData fallback locations.
-            appdata_low = self._appdata_low_path()
-            if not appdata_low:
-                print("[WARN] No fresh XML in PerSpec/TestResults; AppData fallback unavailable on this platform")
-                return
+            candidates = rv.unity_appdata_candidates()
+            if not candidates:
+                print("[WARN] No fresh XML in PerSpec/TestResults; no Unity AppData results found")
+                return None
 
-            for candidate in self._appdata_unity_dirs(appdata_low):
+            for candidate in candidates:
                 source = candidate / "TestResults.xml"
                 if not source.exists():
                     continue
                 src_mtime = datetime.fromtimestamp(source.stat().st_mtime)
-                if cutoff is not None and src_mtime < cutoff:
+                if src_mtime < cutoff:
                     continue
                 dest = results_dir / f"TestResults_{src_mtime.strftime('%Y%m%d_%H%M%S')}.xml"
                 try:
                     shutil.copy2(str(source), str(dest))
                     print(f"[INFO] Imported results XML from Unity AppData: {source} -> {dest}")
-                    return
+                    return dest
                 except OSError as e:
                     print(f"[WARN] Failed to copy {source}: {e}")
 
             print(f"[WARN] Request {request_id} reached terminal status but no results XML was found")
+            return None
         except Exception as e:
             print(f"[WARN] Error while waiting for results XML: {e}")
+            return None
 
     @staticmethod
     def _parse_request_timestamp(value):
@@ -329,46 +386,6 @@ class TestCoordinator:
         except (TypeError, ValueError):
             return None
 
-    @staticmethod
-    def _appdata_low_path() -> Optional[Path]:
-        """Return %LocalAppData%Low on Windows, else None."""
-        local_app = os.environ.get("LOCALAPPDATA")
-        if not local_app:
-            return None
-        low = Path(local_app + "Low")
-        return low if low.exists() else None
-
-    @staticmethod
-    def _appdata_unity_dirs(appdata_low: Path) -> List[Path]:
-        """Mirror C# TestExecutor.cs:602-616 AppData fallback enumeration.
-
-        We don't know Unity's CompanyName/ProductName from Python, so we walk
-        appdata_low/* and accept any directory containing TestResults.xml.
-        """
-        candidates = []
-        try:
-            project_root = Path(get_project_root())
-            project_name = project_root.name
-            preferred_product_names = {project_name, "TestFramework"}
-
-            for company_dir in appdata_low.iterdir():
-                if not company_dir.is_dir():
-                    continue
-                for product_dir in company_dir.iterdir():
-                    if not product_dir.is_dir():
-                        continue
-                    if (product_dir / "TestResults.xml").exists():
-                        score = 0
-                        if product_dir.name in preferred_product_names:
-                            score += 2
-                        if company_dir.name == "DefaultCompany":
-                            score += 1
-                        candidates.append((score, product_dir))
-        except OSError:
-            return []
-        candidates.sort(key=lambda t: t[0], reverse=True)
-        return [c for _, c in candidates]
-    
     def get_test_results(self, request_id: int) -> List[Dict]:
         """
         Get detailed test results for a request
@@ -530,42 +547,133 @@ class TestCoordinator:
             conn.close()
     
     def update_system_heartbeat(self, component: str = "Python"):
-        """Update system heartbeat for monitoring"""
+        """Update system heartbeat for monitoring.
+
+        Written as SELECT-then-UPDATE-or-INSERT rather than ON CONFLICT: `component` has
+        no UNIQUE constraint, so an upsert on it is not valid SQL here.
+        """
         conn = self._get_connection()
         try:
             cursor = conn.cursor()
-            cursor.execute("""
-                INSERT INTO system_status (component, status, last_heartbeat, message)
-                VALUES (?, 'online', CURRENT_TIMESTAMP, 'Active')
-                ON CONFLICT(component) DO UPDATE SET
-                    status = 'online',
-                    last_heartbeat = CURRENT_TIMESTAMP,
-                    message = 'Active'
-            """)
+            cursor.execute("SELECT id FROM system_status WHERE component = ?", (component,))
+            row = cursor.fetchone()
+
+            if row:
+                cursor.execute("""
+                    UPDATE system_status
+                    SET status = 'online', last_heartbeat = CURRENT_TIMESTAMP, message = 'Active'
+                    WHERE id = ?
+                """, (row['id'],))
+            else:
+                cursor.execute("""
+                    INSERT INTO system_status (component, status, last_heartbeat, message)
+                    VALUES (?, 'online', CURRENT_TIMESTAMP, 'Active')
+                """, (component,))
+
             conn.commit()
         except sqlite3.Error:
             # Ignore errors for heartbeat
             pass
         finally:
             conn.close()
-    
-    def print_summary(self, request_id: int):
-        """Print a nice summary of test results"""
+
+    def seconds_since_unity_heartbeat(self) -> Optional[float]:
+        """How long since the Unity Editor last checked in, or None if it never has.
+
+        The editor writes this row roughly once a second while it is alive. Nothing on
+        the Python side used to read it, which is why a request submitted while the
+        editor was restarting sat in 'pending' for the full timeout with no explanation.
+        """
+        conn = self._get_connection()
+        try:
+            cursor = conn.cursor()
+            cursor.execute("""
+                SELECT last_heartbeat FROM system_status
+                WHERE component = 'Unity'
+                ORDER BY last_heartbeat DESC
+                LIMIT 1
+            """)
+            row = cursor.fetchone()
+        except sqlite3.Error:
+            return None
+        finally:
+            conn.close()
+
+        if not row or row['last_heartbeat'] is None:
+            return None
+
+        # Unity writes .NET ticks (sqlite-net), Python writes ISO text. Handle both.
+        parsed = self._parse_request_timestamp(row['last_heartbeat'])
+        if parsed is None:
+            return None
+
+        return max(0.0, (datetime.now() - parsed).total_seconds())
+
+    def is_unity_alive(self, max_age_seconds: float = 15.0) -> bool:
+        """Whether the Unity Editor has checked in recently enough to be running."""
+        age = self.seconds_since_unity_heartbeat()
+        return age is not None and age <= max_age_seconds
+
+    def verify_results(self, request_id: int, xml_path=None):
+        """Check that the results on disk are the results this request asked for.
+
+        Returns an rv.XmlVerification, or None when there is nothing to check against.
+
+        This is the guard the CLI summary was missing: it printed back the filter you
+        typed while the counts beside it came from whatever XML happened to be newest.
+        """
+        status = self.get_request_status(request_id)
+        if not status:
+            return None
+
+        if xml_path is None:
+            results_dir = Path(get_project_root()) / "PerSpec" / "TestResults"
+            if not results_dir.exists():
+                return None
+            xmls = sorted(results_dir.glob("TestResults_*.xml"),
+                          key=lambda p: p.stat().st_mtime, reverse=True)
+            if not xmls:
+                return None
+            xml_path = xmls[0]
+
+        return rv.verify_xml(xml_path, status.get('request_type'), status.get('test_filter'))
+
+    def print_summary(self, request_id: int, xml_path=None) -> bool:
+        """Print a summary of test results.
+
+        Returns False when the results could not be confirmed to belong to this request,
+        so callers can exit non-zero instead of reporting somebody else's green run.
+        """
         status = self.get_request_status(request_id)
         if not status:
             print(f"[ERROR] Request {request_id} not found")
-            return
-        
+            return False
+
+        verification = self.verify_results(request_id, xml_path)
+
         print("\n" + "="*60)
         print(f"Test Request #{request_id} Summary")
         print("="*60)
         print(f"Status: {status['status']}")
         print(f"Platform: {status['test_platform']}")
         print(f"Type: {status['request_type']}")
-        
+
         if status['test_filter']:
-            print(f"Filter: {status['test_filter']}")
-        
+            print(f"Requested filter: {status['test_filter']}")
+
+        if verification is not None:
+            if verification.verdict == rv.EXACT:
+                print(f"Verified: {verification.matched} test(s) in "
+                      f"{rv.describe_classes(verification.matched_names)}")
+            elif verification.verdict == rv.PARTIAL:
+                print(f"Verified: {verification.matched} of {verification.total} test(s) "
+                      f"in the results file match this filter")
+            elif verification.verdict == rv.UNVERIFIABLE:
+                print(f"Verified: not possible for category runs "
+                      f"({verification.total} test(s) in the results file)")
+            else:
+                print(f"Verified: NO - {verification.reason}")
+
         if status['status'] == 'completed':
             print(f"\nResults:")
             print(f"  Total: {status['total_tests']}")
@@ -573,7 +681,7 @@ class TestCoordinator:
             print(f"  Failed: {status['failed_tests']}")
             print(f"  Skipped: {status['skipped_tests']}")
             print(f"  Duration: {status['duration_seconds']:.2f} seconds")
-            
+
             # Show failed tests if any
             if status['failed_tests'] > 0:
                 results = self.get_test_results(request_id)
@@ -584,11 +692,50 @@ class TestCoordinator:
                         print(f"  [FAILED] {test['test_name']}")
                         if test['error_message']:
                             print(f"     {test['error_message']}")
-        
-        elif status['status'] == 'failed':
-            print(f"\n[ERROR] {status['error_message']}")
-        
+
+        elif status['status'] in ('failed', 'timeout', 'inconclusive'):
+            if status['error_message']:
+                print(f"\n[ERROR] {status['error_message']}")
+
         print("="*60 + "\n")
+
+        # A green row backed by somebody else's results is the failure this whole guard
+        # exists for. Shout about it, and correct the row so the next reader is not lied to.
+        if (status['status'] == 'completed'
+                and verification is not None
+                and not verification.can_adopt_as_last_resort):
+            print("!"*60)
+            print("[ERROR] These results do NOT match the tests you asked for.")
+            print(f"  Requested: {status['request_type']} '{status['test_filter']}'")
+            print(f"  Results contain: {rv.describe_classes(verification.all_names)}")
+            print(f"  {verification.reason}")
+            if verification.suggested_filter:
+                print(f"  Try: {verification.suggested_filter}")
+            print("  The request has been marked 'inconclusive' - the requested tests did not run.")
+            print("!"*60 + "\n")
+
+            self._mark_inconclusive(request_id, verification.reason)
+            return False
+
+        # 'inconclusive' means the run produced no usable evidence either way. A caller
+        # must not be able to read that as a pass, so it is not a success here.
+        return status['status'] not in ('failed', 'timeout', 'inconclusive', 'cancelled')
+
+    def _mark_inconclusive(self, request_id: int, reason: str):
+        """Downgrade a request that reported completion it cannot support."""
+        conn = self._get_connection()
+        try:
+            cursor = conn.cursor()
+            cursor.execute("""
+                UPDATE test_requests
+                SET status = 'inconclusive', error_message = ?
+                WHERE id = ?
+            """, (reason, request_id))
+            conn.commit()
+        except sqlite3.Error as e:
+            print(f"[WARN] Could not mark request {request_id} inconclusive: {e}")
+        finally:
+            conn.close()
 
 
 # Convenience functions for quick operations

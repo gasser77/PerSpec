@@ -1,6 +1,13 @@
 #!/usr/bin/env python3
 """
 Quick Test Runner - Simple interface for common test operations
+
+Exit codes:
+  0  the run finished and its results are the results you asked for
+  1  general error, cancellation, or the run failed / timed out
+  2  compilation errors - the tests could not run
+  3  the run reported completion but its results do not match the requested filter
+  4  the Unity Editor is not responding (restarting, importing, or closed)
 """
 
 
@@ -13,7 +20,8 @@ import sys
 import argparse
 import subprocess
 import json
-from test_coordinator import TestCoordinator, TestPlatform, TestRequestType
+from test_coordinator import (TestCoordinator, TestPlatform, TestRequestType,
+                             UnityNotRespondingError)
 
 def check_compilation_errors():
     """Check whether the current Unity EditMode session logged compilation errors.
@@ -55,6 +63,27 @@ def check_compilation_errors():
     except Exception as e:
         print(f"Warning: Could not check for compilation errors: {e}")
         return False, None
+
+# Unity writes its heartbeat about once a second. Allow generous slack for a busy or
+# unfocused editor before declaring it gone.
+UNITY_HEARTBEAT_MAX_AGE = 30.0
+
+# How long a request may sit non-terminal with no heartbeat before we stop waiting.
+# The point is to fail in seconds instead of burning the full --timeout in silence.
+UNITY_DEAD_GRACE_SECONDS = 45.0
+
+
+def describe_unity_liveness(coordinator):
+    """Returns (is_alive, human description) for the Unity Editor."""
+    age = coordinator.seconds_since_unity_heartbeat()
+
+    if age is None:
+        return False, "Unity has never checked in (no heartbeat recorded)"
+    if age > UNITY_HEARTBEAT_MAX_AGE:
+        return False, f"Unity last checked in {age:.0f}s ago"
+
+    return True, f"Unity is running (last checked in {age:.0f}s ago)"
+
 
 def main():
     # Ensure UTF-8 encoding for emoji/Unicode characters
@@ -187,6 +216,12 @@ def main():
                 else:
                     print("[OK] No compilation errors found")
             
+            # A request submitted to an editor that is not running just sits in 'pending'.
+            # Say so up front rather than letting --wait discover it 300 seconds later.
+            alive, liveness = describe_unity_liveness(coordinator)
+            if not alive:
+                print(f"[WARN] {liveness}. The request will queue until the editor is back.")
+
             # Focus Unity BEFORE submitting request for immediate processing
             if args.focus:
                 try:
@@ -225,8 +260,22 @@ def main():
 
                 if args.wait:
                     print(f"Waiting for completion (timeout: {args.timeout}s)...")
-                    coordinator.wait_for_completion(request_id, args.timeout)
-                    coordinator.print_summary(request_id)
+                    try:
+                        status = coordinator.wait_for_completion(
+                            request_id, args.timeout,
+                            unity_dead_grace_seconds=UNITY_DEAD_GRACE_SECONDS,
+                            unity_heartbeat_max_age=UNITY_HEARTBEAT_MAX_AGE)
+                    except UnityNotRespondingError as e:
+                        print(f"\n[ERROR] {e}")
+                        print("[HINT] Check that the Unity Editor is open and has finished "
+                              "importing. Request "
+                              f"{request_id} is still queued and will run when it is back.")
+                        sys.exit(4)
+
+                    if not coordinator.print_summary(request_id, status.get('results_xml')):
+                        # Either the run failed outright, or its results were not the
+                        # results that were asked for. Both must be non-zero.
+                        sys.exit(3 if status.get('status') == 'completed' else 1)
                 elif len(platforms) > 1 and index == 0:
                     # Without --wait both requests are queued at once; Unity's single
                     # dispatch funnel still runs them one after the other.

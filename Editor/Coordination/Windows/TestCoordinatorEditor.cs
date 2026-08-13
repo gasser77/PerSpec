@@ -44,7 +44,13 @@ namespace PerSpec.Editor.Coordination
         private const string SessionKeyActiveRequestId = "PerSpec.TestRun.ActiveRequestId";
         private const string SessionKeyDispatchTicks = "PerSpec.TestRun.DispatchTicks";
         private const string SessionKeyRetryCount = "PerSpec.TestRun.RetryCount";
+        private const string SessionKeyPlatform = "PerSpec.TestRun.Platform";
         private const int MaxReloadRetries = 1;
+
+        // How long to let PlayModeTestCompletionChecker finish a PlayMode run before the
+        // interruption ladder takes over. Entering play mode always triggers a domain reload,
+        // so that reload must not be mistaken for a crash.
+        private const double PlayModeReconcileDelaySeconds = 15.0;
 
         static TestCoordinatorEditor()
         {
@@ -115,12 +121,16 @@ namespace PerSpec.Editor.Coordination
         /// domain reload tears the run down mid-flight. SessionState survives assembly
         /// reloads, unlike every static field in this class.
         /// </summary>
-        private static void RememberInFlightRequest(int requestId)
+        private static void RememberInFlightRequest(TestRequest request)
         {
             try
             {
-                SessionState.SetInt(SessionKeyActiveRequestId, requestId);
+                SessionState.SetInt(SessionKeyActiveRequestId, request.Id);
                 SessionState.SetString(SessionKeyDispatchTicks, DateTime.Now.Ticks.ToString());
+
+                // The platform decides how a reload should be interpreted: for PlayMode it is
+                // routine, for EditMode it means a recompile ate the run.
+                SessionState.SetString(SessionKeyPlatform, request.TestPlatform ?? string.Empty);
             }
             catch (Exception ex)
             {
@@ -138,6 +148,7 @@ namespace PerSpec.Editor.Coordination
             {
                 SessionState.EraseInt(SessionKeyActiveRequestId);
                 SessionState.EraseString(SessionKeyDispatchTicks);
+                SessionState.EraseString(SessionKeyPlatform);
                 if (clearRetryCount)
                 {
                     SessionState.EraseInt(SessionKeyRetryCount);
@@ -153,6 +164,13 @@ namespace PerSpec.Editor.Coordination
         /// Reconciles the test run that was executing when this domain reload started.
         /// Order of preference: recover real results from disk, otherwise retry the run once,
         /// otherwise mark it failed. A request is never left in a non-terminal state.
+        ///
+        /// Not every domain reload is an interruption. Entering PlayMode always causes one, and
+        /// exiting it causes another - and [InitializeOnLoad] constructors run BEFORE
+        /// playModeStateChanged(EnteredEditMode), so this method reaches the row before
+        /// PlayModeTestCompletionChecker gets a chance to finish it. Treating either reload as a
+        /// crash re-queued a live run to 'pending', which dispatched it a second time and let the
+        /// duplicate adopt the first run's results.
         /// </summary>
         private static void RecoverInterruptedTestRequest()
         {
@@ -162,7 +180,17 @@ namespace PerSpec.Editor.Coordination
                 return;
             }
 
+            // Reload while play mode is running or starting: routine, and the marker must
+            // survive it. Returning before the try block keeps the finally from erasing it.
+            if (EditorApplication.isPlayingOrWillChangePlaymode || EditorApplication.isPlaying)
+            {
+                Debug.Log($"[TestCoordinator] Request #{requestId}: domain reload is part of entering " +
+                          "or holding PlayMode - not an interruption");
+                return;
+            }
+
             bool retryScheduled = false;
+            bool deferred = false;
 
             try
             {
@@ -182,17 +210,29 @@ namespace PerSpec.Editor.Coordination
                 Debug.LogWarning($"[TestCoordinator] Request #{requestId} was interrupted by a domain reload " +
                                  $"(status: {request.Status}) - attempting recovery");
 
-                DateTime dispatchTime = ReadDispatchTime();
+                DateTime dispatchTime = ResolveDispatchTime(request);
 
                 // 1. Did Unity actually finish and write results before the reload?
-                string resultFile = FindResultFileNewerThan(dispatchTime.AddSeconds(-5));
+                string resultFile = FindResultFileNewerThan(dispatchTime.AddSeconds(-5), request);
                 if (!string.IsNullOrEmpty(resultFile) && TryRecoverFromResultFile(request, resultFile))
                 {
                     Debug.Log($"[TestCoordinator] Recovered request #{requestId} from {Path.GetFileName(resultFile)}");
                     return;
                 }
 
-                // 2. No usable results - retry the run once before giving up.
+                // 2. This is the reload that fires as PlayMode exits. PlayModeTestCompletionChecker
+                //    has not run yet and owns completion for these runs, so hand off to it and only
+                //    fall back to the retry ladder if it has produced nothing a few seconds later.
+                if (IsPlayModeRequest(request))
+                {
+                    deferred = true;
+                    ScheduleDeferredReconcile(requestId, PlayModeReconcileDelaySeconds);
+                    Debug.Log($"[TestCoordinator] Request #{requestId} is a PlayMode run - waiting " +
+                              $"{PlayModeReconcileDelaySeconds:F0}s for the completion checker before recovering");
+                    return;
+                }
+
+                // 3. No usable results - retry the run once before giving up.
                 int retries = SessionState.GetInt(SessionKeyRetryCount, 0);
                 if (retries < MaxReloadRetries)
                 {
@@ -208,7 +248,7 @@ namespace PerSpec.Editor.Coordination
                     return;
                 }
 
-                // 3. Already retried once - stop here so a flaky compile cannot loop.
+                // 4. Already retried once - stop here so a flaky compile cannot loop.
                 _dbManager.UpdateRequestStatus(request.Id, "failed",
                     "Interrupted by domain reload during test execution; the automatic retry was interrupted too");
                 _dbManager.LogExecution(request.Id, "ERROR", "Unity",
@@ -222,16 +262,113 @@ namespace PerSpec.Editor.Coordination
             }
             finally
             {
-                ForgetInFlightRequest(clearRetryCount: !retryScheduled);
+                // A deferred reconcile still needs the marker, so leave it in place for it.
+                if (!deferred)
+                {
+                    ForgetInFlightRequest(clearRetryCount: !retryScheduled);
+                }
             }
         }
 
         /// <summary>
-        /// Reads the dispatch timestamp stored alongside the in-flight request id.
-        /// Falls back to "five minutes ago" so a missing value never widens the search
-        /// window to the whole disk history.
+        /// Whether the in-flight request is a PlayMode run, preferring the platform recorded at
+        /// dispatch time over the DB row.
         /// </summary>
-        private static DateTime ReadDispatchTime()
+        private static bool IsPlayModeRequest(TestRequest request)
+        {
+            string platform = SessionState.GetString(SessionKeyPlatform, string.Empty);
+            if (string.IsNullOrEmpty(platform))
+            {
+                platform = request?.TestPlatform;
+            }
+
+            return platform == "PlayMode";
+        }
+
+        /// <summary>
+        /// Re-runs the interruption ladder after a delay, but only if the request is still
+        /// non-terminal by then. Gives PlayModeTestCompletionChecker time to publish real results
+        /// instead of racing it.
+        ///
+        /// This covers domain reloads only. A genuine editor crash or restart wipes SessionState
+        /// entirely, so that case is - and always was - owned by RecoverOrphanedRequests and its
+        /// 3-minute stuck-request sweep.
+        /// </summary>
+        private static void ScheduleDeferredReconcile(int requestId, double delaySeconds)
+        {
+            double dueTime = EditorApplication.timeSinceStartup + delaySeconds;
+            EditorApplication.CallbackFunction tick = null;
+
+            tick = () =>
+            {
+                if (EditorApplication.timeSinceStartup < dueTime)
+                {
+                    return;
+                }
+
+                EditorApplication.update -= tick;
+
+                try
+                {
+                    // Something finished it in the meantime (the usual case) - stop here.
+                    if (SessionState.GetInt(SessionKeyActiveRequestId, -1) != requestId)
+                    {
+                        return;
+                    }
+
+                    var request = _dbManager?.GetRequestById(requestId);
+                    if (request == null || TerminalStatuses.Contains(request.Status))
+                    {
+                        ForgetInFlightRequest();
+                        return;
+                    }
+
+                    Debug.LogWarning($"[TestCoordinator] PlayMode request #{requestId} still {request.Status} " +
+                                     $"after {delaySeconds:F0}s - running interruption recovery");
+
+                    // Clear the platform marker so the ladder is not deferred a second time.
+                    SessionState.EraseString(SessionKeyPlatform);
+
+                    RecoverInterruptedTestRequest();
+                }
+                catch (Exception ex)
+                {
+                    Debug.LogWarning($"[TestCoordinator] Deferred reconcile failed: {ex.Message}");
+                }
+            };
+
+            EditorApplication.update += tick;
+        }
+
+        /// <summary>
+        /// Clears the in-flight marker when another component finished the request.
+        /// Called by PlayModeTestCompletionChecker so a completed run is never later mistaken
+        /// for an interrupted one.
+        /// </summary>
+        internal static void NotifyRequestFinalizedExternally(int requestId)
+        {
+            try
+            {
+                if (SessionState.GetInt(SessionKeyActiveRequestId, -1) == requestId)
+                {
+                    ForgetInFlightRequest();
+                }
+            }
+            catch (Exception ex)
+            {
+                Debug.LogWarning($"[TestCoordinator] Could not clear in-flight marker for #{requestId}: {ex.Message}");
+            }
+        }
+
+        /// <summary>
+        /// When this run was dispatched, in decreasing order of reliability.
+        ///
+        /// SessionState is lost on an editor restart, so fall back to the request's own
+        /// timestamps - they survive anything. If even those are unknown, return MaxValue:
+        /// "I do not know when this ran" has to mean "adopt nothing", not "adopt anything from
+        /// the last five minutes", which is what the old fallback meant.
+        /// </summary>
+        private static DateTime ResolveDispatchTime(TestRequest request)
         {
             string raw = SessionState.GetString(SessionKeyDispatchTicks, string.Empty);
             if (!string.IsNullOrEmpty(raw) && long.TryParse(raw, out long ticks))
@@ -242,36 +379,44 @@ namespace PerSpec.Editor.Coordination
                 }
                 catch (ArgumentOutOfRangeException)
                 {
-                    // Corrupt value - fall through to the default below.
+                    // Corrupt value - fall through.
                 }
             }
 
-            return DateTime.Now.AddMinutes(-5);
+            if (request != null && request.StartedAt.HasValue && request.StartedAt.Value != default)
+            {
+                return request.StartedAt.Value;
+            }
+
+            if (request != null && request.CreatedAt != default)
+            {
+                return request.CreatedAt;
+            }
+
+            return DateTime.MaxValue;
         }
 
         /// <summary>
-        /// Finds the newest test result XML written after the given cutoff, checking
-        /// PerSpec/TestResults first and then Unity's own AppData output locations.
+        /// Finds the newest test result XML that was written after the given cutoff AND actually
+        /// contains this request's tests, checking PerSpec/TestResults first and then Unity's own
+        /// AppData output locations.
         /// </summary>
-        private static string FindResultFileNewerThan(DateTime cutoff)
+        private static string FindResultFileNewerThan(DateTime cutoff, TestRequest request)
         {
             try
             {
                 string projectPath = Directory.GetParent(Application.dataPath).FullName;
                 string testResultsPath = Path.Combine(projectPath, "PerSpec", "TestResults");
 
+                var candidates = new List<string>();
+
                 if (Directory.Exists(testResultsPath))
                 {
-                    var newest = Directory.GetFiles(testResultsPath, "TestResults_*.xml")
+                    candidates.AddRange(Directory.GetFiles(testResultsPath, "TestResults_*.xml")
                         .Select(f => new FileInfo(f))
                         .Where(fi => fi.LastWriteTime >= cutoff)
                         .OrderByDescending(fi => fi.LastWriteTime)
-                        .FirstOrDefault();
-
-                    if (newest != null)
-                    {
-                        return newest.FullName;
-                    }
+                        .Select(fi => fi.FullName));
                 }
 
                 // Fall back to Unity's own output locations.
@@ -279,8 +424,19 @@ namespace PerSpec.Editor.Coordination
                 if (!string.IsNullOrEmpty(appDataResult) &&
                     File.GetLastWriteTime(appDataResult) >= cutoff)
                 {
-                    return appDataResult;
+                    candidates.Add(appDataResult);
                 }
+
+                // Recovery is the end of the line for this run, so a broader run's file is
+                // better than nothing - it contributes only its matching subset.
+                string chosen = TestResultVerifier.PickBest(candidates, request, true, out var verification);
+
+                if (chosen == null && candidates.Count > 0)
+                {
+                    TestResultVerifier.LogRejection("TestCoordinator", verification);
+                }
+
+                return chosen;
             }
             catch (Exception ex)
             {
@@ -333,6 +489,8 @@ namespace PerSpec.Editor.Coordination
 
                     // Check if test results exist in AppData (Unity's default output location)
                     string appDataResult = FindAppDataTestResult();
+                    TestResultVerification verification = default;
+                    bool sawResultsFile = false;
 
                     if (!string.IsNullOrEmpty(appDataResult) && File.Exists(appDataResult))
                     {
@@ -340,11 +498,12 @@ namespace PerSpec.Editor.Coordination
                         var resultFileTime = File.GetLastWriteTime(appDataResult);
                         if (resultFileTime > request.CreatedAt)
                         {
+                            sawResultsFile = true;
                             Debug.Log($"[TestCoordinator] Found potential results at {appDataResult} " +
                                      $"(written: {resultFileTime:HH:mm:ss}, request created: {request.CreatedAt:HH:mm:ss})");
 
                             // Try to recover using the result file
-                            if (TryRecoverFromResultFile(request, appDataResult))
+                            if (TryRecoverFromResultFile(request, appDataResult, out verification))
                             {
                                 Debug.Log($"[TestCoordinator] Successfully recovered request #{request.Id} from AppData results");
                                 continue;
@@ -352,13 +511,25 @@ namespace PerSpec.Editor.Coordination
                         }
                     }
 
-                    // No valid results found - mark as failed due to domain reload
-                    _dbManager.UpdateRequestStatus(request.Id, "failed",
-                        "Request interrupted by domain reload - no results recovered");
-                    _dbManager.LogExecution(request.Id, "WARN", "Unity",
-                        "Request orphaned by domain reload, marked as failed");
+                    // Distinguish the two very different reasons we got here. 'failed' means the
+                    // run left no trace at all; 'inconclusive' means results existed but were not
+                    // this request's - and the latter must never be silently reported as a pass.
+                    if (sawResultsFile && verification.IsDefinitiveMiss)
+                    {
+                        _dbManager.UpdateRequestStatus(request.Id, "inconclusive", verification.Reason);
+                        _dbManager.LogExecution(request.Id, "WARN", "Unity", verification.Reason);
 
-                    Debug.LogWarning($"[TestCoordinator] Marked stuck request #{request.Id} as failed (no results found)");
+                        Debug.LogWarning($"[TestCoordinator] Marked stuck request #{request.Id} as inconclusive: {verification.Reason}");
+                    }
+                    else
+                    {
+                        _dbManager.UpdateRequestStatus(request.Id, "failed",
+                            "Request interrupted by domain reload - no results recovered");
+                        _dbManager.LogExecution(request.Id, "WARN", "Unity",
+                            "Request orphaned by domain reload, marked as failed");
+
+                        Debug.LogWarning($"[TestCoordinator] Marked stuck request #{request.Id} as failed (no results found)");
+                    }
                 }
             }
             catch (Exception ex)
@@ -393,54 +564,59 @@ namespace PerSpec.Editor.Coordination
         }
 
         /// <summary>
-        /// Attempts to recover a stuck request by parsing an existing result file
+        /// Attempts to recover a stuck request by parsing an existing result file.
+        ///
+        /// Returns false when the file cannot be attributed to this request, so the caller can
+        /// fall through to its own handling rather than reporting someone else's results.
         /// </summary>
         private static bool TryRecoverFromResultFile(TestRequest request, string resultFilePath)
         {
+            return TryRecoverFromResultFile(request, resultFilePath, out _);
+        }
+
+        private static bool TryRecoverFromResultFile(TestRequest request, string resultFilePath,
+                                                     out TestResultVerification verification)
+        {
+            verification = default;
+
             try
             {
-                // Read and parse the XML file
-                string xmlContent = File.ReadAllText(resultFilePath);
+                // Content check first. Timestamps cannot tell one run's output from another's,
+                // and this path used to read the root count attributes straight into the request -
+                // which is how a request reported a different class's green results.
+                verification = TestResultVerifier.Verify(resultFilePath, request);
 
-                // Basic XML validation
-                if (!xmlContent.Contains("<test-run") || !xmlContent.Contains("</test-run>"))
+                if (!verification.CanAdoptAsLastResort)
                 {
-                    Debug.LogWarning($"[TestCoordinator] Result file appears incomplete or invalid");
+                    TestResultVerifier.LogRejection("TestCoordinator", verification);
                     return false;
                 }
 
-                // Parse test counts from XML attributes
-                int total = ParseXmlAttribute(xmlContent, "total");
-                int passed = ParseXmlAttribute(xmlContent, "passed");
-                int failed = ParseXmlAttribute(xmlContent, "failed");
-                int skipped = ParseXmlAttribute(xmlContent, "skipped");
+                // Counts come from the matching test-case leaves, so a broader run's file
+                // contributes only this request's subset.
+                string status = verification.IsSynthetic ? "inconclusive" : "completed";
+                string reason = verification.Match == TestResultMatch.Exact && !verification.IsSynthetic
+                    ? null
+                    : verification.Reason;
 
-                // Calculate duration
-                float duration = 0;
-                var durationMatch = System.Text.RegularExpressions.Regex.Match(xmlContent, @"duration=""([^""]+)""");
-                if (durationMatch.Success && float.TryParse(durationMatch.Groups[1].Value,
-                    System.Globalization.NumberStyles.Float,
-                    System.Globalization.CultureInfo.InvariantCulture, out float parsedDuration))
-                {
-                    duration = parsedDuration;
-                }
-
-                // Update the request with recovered results
                 _dbManager.UpdateRequestResults(
                     request.Id,
-                    "completed",
-                    total,
-                    passed,
-                    failed,
-                    skipped,
-                    duration
+                    status,
+                    verification.MatchedCases,
+                    verification.Passed,
+                    verification.Failed,
+                    verification.Skipped + verification.Inconclusive,
+                    verification.Duration,
+                    reason
                 );
 
                 _dbManager.LogExecution(request.Id, "INFO", "Unity",
-                    $"Recovered from domain reload: {passed}/{total} passed, {failed} failed");
+                    $"Recovered from domain reload: {verification.Passed}/{verification.MatchedCases} passed, " +
+                    $"{verification.Failed} failed ({verification.Reason})");
 
-                // Copy the result file to PerSpec/TestResults for consistency
-                CopyResultToPerSpecDirectory(resultFilePath, request.Id);
+                // Copy the result file to PerSpec/TestResults for consistency.
+                // No gate needed there - this is its only caller and it sits behind the check above.
+                CopyResultToPerSpecDirectory(resultFilePath, request);
 
                 return true;
             }
@@ -452,20 +628,9 @@ namespace PerSpec.Editor.Coordination
         }
 
         /// <summary>
-        /// Parses an integer attribute from NUnit XML format
-        /// </summary>
-        private static int ParseXmlAttribute(string xml, string attributeName)
-        {
-            var match = System.Text.RegularExpressions.Regex.Match(xml, $@"{attributeName}=""(\d+)""");
-            if (match.Success && int.TryParse(match.Groups[1].Value, out int value))
-                return value;
-            return 0;
-        }
-
-        /// <summary>
         /// Copies a recovered result file to the PerSpec/TestResults directory
         /// </summary>
-        private static void CopyResultToPerSpecDirectory(string sourcePath, int requestId)
+        private static void CopyResultToPerSpecDirectory(string sourcePath, TestRequest request)
         {
             try
             {
@@ -475,7 +640,16 @@ namespace PerSpec.Editor.Coordination
                 if (!Directory.Exists(testResultsPath))
                     Directory.CreateDirectory(testResultsPath);
 
-                string destFileName = $"TestResults_Recovered_{requestId}_{DateTime.Now:yyyyMMdd_HHmmss}.xml";
+                // Put the request's identity in the file name so a human looking at the folder
+                // can tell which run each artifact came from without opening it.
+                string tag = SanitizeForFileName(request.TestFilter);
+                if (!string.IsNullOrEmpty(tag))
+                {
+                    tag = "_" + tag;
+                }
+
+                string destFileName =
+                    $"TestResults_Recovered_{request.Id}_{request.RequestType}{tag}_{DateTime.Now:yyyyMMdd_HHmmss}.xml";
                 string destPath = Path.Combine(testResultsPath, destFileName);
 
                 File.Copy(sourcePath, destPath, true);
@@ -485,6 +659,31 @@ namespace PerSpec.Editor.Coordination
             {
                 Debug.LogWarning($"[TestCoordinator] Could not copy result file: {ex.Message}");
             }
+        }
+
+        /// <summary>
+        /// Trims a test filter down to something safe and short enough for a file name.
+        /// </summary>
+        private static string SanitizeForFileName(string value)
+        {
+            if (string.IsNullOrEmpty(value))
+            {
+                return string.Empty;
+            }
+
+            // The trailing segment is the useful part - the namespace is just noise here.
+            int lastDot = value.LastIndexOf('.');
+            string shortName = lastDot >= 0 && lastDot < value.Length - 1
+                ? value.Substring(lastDot + 1)
+                : value;
+
+            var cleaned = new System.Text.StringBuilder(shortName.Length);
+            foreach (char c in shortName)
+            {
+                cleaned.Append(char.IsLetterOrDigit(c) || c == '_' ? c : '-');
+            }
+
+            return cleaned.ToString();
         }
         
         private static void SetupBackgroundPolling()
@@ -633,7 +832,7 @@ namespace PerSpec.Editor.Coordination
                 Filter filter = CreateTestFilter(request);
 
                 // Persist the in-flight marker so a domain reload mid-run can be reconciled.
-                RememberInFlightRequest(request.Id);
+                RememberInFlightRequest(request);
 
                 // Execute tests
                 _testExecutor.ExecuteTests(request, filter, OnTestComplete);
@@ -863,61 +1062,87 @@ namespace PerSpec.Editor.Coordination
             Debug.Log($"  - Current Request ID: {_currentRequestId}");
         }
         
+        /// <summary>
+        /// Trims PerSpec/TestResults before a dispatch, keeping the most recent runs.
+        ///
+        /// This used to delete everything. That destroyed the very evidence needed to tell one
+        /// run's output from another's, and left the "is this file newer than anything local?"
+        /// heuristic comparing against an empty folder - so any AppData XML, however old, looked
+        /// like the freshest results available. Retention is safe now that every adoption path
+        /// checks file contents against the request.
+        /// </summary>
         private static void CleanTestResultsDirectory()
         {
+            const int KeepMostRecentRuns = 5;
+
             try
             {
                 string projectPath = Directory.GetParent(Application.dataPath).FullName;
                 string testResultsPath = Path.Combine(projectPath, "PerSpec", "TestResults");
-                
-                if (Directory.Exists(testResultsPath))
+
+                if (!Directory.Exists(testResultsPath))
                 {
-                    // Get all files in the TestResults directory
-                    string[] files = Directory.GetFiles(testResultsPath, "*", SearchOption.AllDirectories);
-                    
-                    foreach (string file in files)
-                    {
-                        try
-                        {
-                            File.Delete(file);
-                        }
-                        catch (Exception ex)
-                        {
-                            Debug.LogWarning($"[TestCoordinator] Failed to delete file {file}: {ex.Message}");
-                        }
-                    }
-                    
-                    // Get and delete all subdirectories
-                    string[] directories = Directory.GetDirectories(testResultsPath, "*", SearchOption.AllDirectories);
-                    
-                    // Delete directories in reverse order (deepest first)
-                    for (int i = directories.Length - 1; i >= 0; i--)
-                    {
-                        try
-                        {
-                            Directory.Delete(directories[i], true);
-                        }
-                        catch (Exception ex)
-                        {
-                            Debug.LogWarning($"[TestCoordinator] Failed to delete directory {directories[i]}: {ex.Message}");
-                        }
-                    }
-                    
-                    Debug.Log($"[TestCoordinator] Cleaned TestResults directory");
-                }
-                else
-                {
-                    // Create the directory if it doesn't exist
                     Directory.CreateDirectory(testResultsPath);
                     Debug.Log($"[TestCoordinator] Created TestResults directory");
+                    return;
                 }
+
+                // Keep the newest N XML files and whatever sits beside them (.summary.txt).
+                var keep = new HashSet<string>(
+                    Directory.GetFiles(testResultsPath, "*.xml")
+                        .Select(f => new FileInfo(f))
+                        .OrderByDescending(fi => fi.LastWriteTime)
+                        .Take(KeepMostRecentRuns)
+                        .SelectMany(fi => new[]
+                        {
+                            fi.FullName,
+                            Path.ChangeExtension(fi.FullName, ".summary.txt")
+                        }),
+                    StringComparer.OrdinalIgnoreCase);
+
+                int deleted = 0;
+
+                foreach (string file in Directory.GetFiles(testResultsPath, "*", SearchOption.AllDirectories))
+                {
+                    if (keep.Contains(file))
+                    {
+                        continue;
+                    }
+
+                    try
+                    {
+                        File.Delete(file);
+                        deleted++;
+                    }
+                    catch (Exception ex)
+                    {
+                        Debug.LogWarning($"[TestCoordinator] Failed to delete file {file}: {ex.Message}");
+                    }
+                }
+
+                // Subdirectories are not part of the retention set - nothing writes into them.
+                string[] directories = Directory.GetDirectories(testResultsPath, "*", SearchOption.AllDirectories);
+                for (int i = directories.Length - 1; i >= 0; i--)
+                {
+                    try
+                    {
+                        Directory.Delete(directories[i], true);
+                    }
+                    catch (Exception ex)
+                    {
+                        Debug.LogWarning($"[TestCoordinator] Failed to delete directory {directories[i]}: {ex.Message}");
+                    }
+                }
+
+                Debug.Log($"[TestCoordinator] Trimmed TestResults directory " +
+                          $"(deleted {deleted}, kept the {KeepMostRecentRuns} most recent runs)");
             }
             catch (Exception ex)
             {
                 Debug.LogError($"[TestCoordinator] Error cleaning TestResults directory: {ex.Message}");
             }
         }
-        
+
         #region Debug Methods (formerly in TestCoordinationDebug)
         
         // Force reinitialization - accessed via Control Center

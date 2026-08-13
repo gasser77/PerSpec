@@ -5,6 +5,105 @@ All notable changes to the PerSpec Testing Framework will be documented in this 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.9.0] - 2026-08-13
+
+### Added
+- **Content verification for every test result file**
+  - New `TestResultVerifier` (C#) and `results_verification.py` (Python) answer one question:
+    do the `<test-case fullname>` entries in this XML actually belong to the request that is
+    about to adopt them? Every path that could mark a request terminal now goes through it.
+  - The verdict is three-way rather than a boolean. `Exact` is the healthy outcome for a
+    filtered run and is required while a run may still be live. `Partial` means the file is
+    from a broader run; it is accepted only at the true end of a run, and reports the matching
+    subset rather than the whole file's counts. `None` and `Empty` are never adopted.
+  - Category runs report `Unverifiable`: NUnit output carries no category information, so they
+    are still accepted on their timestamp, but the row says so instead of implying a match.
+  - When an unqualified class name matches nothing, the verifier suggests the fully qualified
+    name it found in the results, so the failure is actionable.
+- **`quick_test.py` fails fast when the Unity Editor is not responding**
+  - Unity writes a heartbeat to `system_status` about once a second. Nothing on the Python
+    side ever read it, so a request submitted while the editor was restarting sat in `pending`
+    until the full 300-second timeout expired with no explanation.
+  - `--wait` now aborts within seconds with `UnityNotRespondingError` and exit code **4**, and
+    a warning is printed up front if the editor is already silent at submit time.
+- **Staleness guards in `test_results.py`**
+  - `latest` prints the age of the results it is showing, and warns loudly when they are more
+    than an hour old.
+  - Unity's AppData `TestResults.xml` is no longer imported when it is older than 24 hours.
+    New `--max-age <hours>` and `--allow-stale` flags on `latest` and `list`.
+- **`TestResultVerifierTests`** EditMode suite covering right class, wrong class, empty run,
+  partial match, parameterised names, synthetic files, `all` and `category`.
+
+### Fixed
+- **A test run could report a different class's results as its own**
+  - Symptom: `quick_test.py class B -p play --wait` printed `Status: completed`, echoed
+    `Filter: B`, and reported 6 passing tests - which were class A's tests from the previous
+    run. Class B never executed.
+  - Root cause: the NUnit filter was correct all along
+    (`^Namespace\.Class(\.|$)`, escaped and anchored). The failure was in result *attribution* -
+    four separate code paths chose which XML belonged to a request using file modification
+    time alone, which cannot tell one run's output from another's.
+  - All four now verify contents first: `TestExecutor.CheckAndProcessResultFile`,
+    `PlayModeTestCompletionChecker.ParseXmlAndUpdateRequest`,
+    `TestCoordinatorEditor.TryRecoverFromResultFile`, and the AppData import paths.
+  - `RunFinished` additionally checks the in-memory callback results against the filter, which
+    catches the case Unity cannot report: a filter resolving to zero tests still produces a
+    clean, empty, "successful" run.
+- **Entering PlayMode was treated as a crash, causing a duplicate dispatch**
+  - Entering play mode always triggers a domain reload, and exiting it triggers another.
+    `[InitializeOnLoad]` constructors run *before* `playModeStateChanged(EnteredEditMode)`, so
+    `RecoverInterruptedTestRequest` reached the row before `PlayModeTestCompletionChecker` had
+    any chance to finish it, and re-queued a live run to `pending`. The request was then
+    dispatched a second time and the duplicate could adopt the first run's results.
+  - The in-play reload is now recognised and skipped. The exit reload hands off to
+    `PlayModeTestCompletionChecker` and only falls back to the interruption ladder if the row
+    is still non-terminal 15 seconds later. A genuine editor crash is unaffected - SessionState
+    does not survive a restart, so that case was always owned by the 3-minute orphan sweep.
+- **An empty result XML no longer reports `completed`**
+  - `PlayModeTestCompletionChecker` marked a run with zero test-cases as `completed` with
+    `Total: 0`. A run that executed nothing is `inconclusive`.
+- **The XML exporter counted every pass twice**
+  - `TestFinished` incremented the counters once per finished node - suites included - and then
+    `RunFinished` walked the tree and counted the leaves again. An 18-test run exported
+    `total="18" passed="44"` with a summary claiming `Pass Rate: 244.4%`, and every path that
+    parsed those attributes wrote the inflated numbers into the database.
+  - `RunFinished` now resets the counters before its tree walk, which counts leaves only, and
+    `TestFinished` no longer stores suite nodes.
+- **Three `now - 5 minutes` fallback windows replaced**
+  - Used when a dispatch time was unknown, each was wide enough to swallow the previous run's
+    results. The dispatch time now falls back through SessionState, `started_at`, `created_at`,
+    and finally to "adopt nothing" - not knowing when a run started must not mean accepting
+    anything recent.
+- **`PerSpec/TestResults` is trimmed instead of emptied**
+  - Wiping the directory before every dispatch destroyed the evidence needed to tell runs
+    apart, and left the "newer than anything local" heuristic comparing against an empty
+    folder - so any AppData XML, however old, looked like the freshest results available.
+    The five most recent runs are now kept.
+- **`"TestFramework"` is no longer a preferred product name for every project**
+  - The AppData scan hard-coded it, ranking an unrelated project's stale results above the
+    real ones. Company and product are now read from `ProjectSettings.asset`, and once any
+    folder matches this project the scan no longer falls through to folders that do not.
+- **`update_system_heartbeat` never wrote anything**
+  - The statement used a `?` placeholder with no bindings and an `ON CONFLICT(component)`
+    clause on a column with no UNIQUE constraint, and the resulting error was swallowed.
+    Rewritten as SELECT-then-UPDATE-or-INSERT.
+- **`--wait` no longer accepts any XML when `created_at` cannot be parsed**
+  - It now falls back to "written since we started waiting" instead of the newest file on disk.
+
+### Changed
+- **`quick_test.py --wait` exit codes are now meaningful**: `0` verified pass, `1` failed or
+  timed out, `2` compilation errors, `3` results did not match the requested filter, `4` Unity
+  not responding. Scripted callers can no longer read a mismatch as success.
+- **The summary prints `Requested filter:` and `Verified:`** side by side. The first is what you
+  asked for, the second is what the results actually contain. When they disagree the run is
+  reported loudly and the row is corrected to `inconclusive`.
+- **Unqualified class filters now surface as `inconclusive` rather than a green pass.** This is
+  not a behaviour regression: Unity's anchored `^MyTests(\.|$)` regex never matched
+  `Namespace.MyTests.Method`, so those runs were already executing nothing and only appeared to
+  pass by adopting another run's file. The error message names the qualified filter to use.
+- **`.summary.txt` is no longer preferred over the XML** when both exist. It carries the same
+  counts with no test names attached, so it cannot be verified.
+
 ## [1.8.1] - 2026-08-07
 
 ### Added

@@ -80,8 +80,19 @@ namespace PerSpec.Editor.TestExport
         public void RunFinished(ITestResultAdaptor result)
         {
             _runEndTime = DateTime.Now;
+
+            // TestFinished already incremented these once per finished node - including
+            // test-suite nodes - and ProcessTestResults is about to walk the tree and count
+            // the leaves again. Two overlapping counters is how an 18-test run exported
+            // passed="44" (18 leaves + 8 suites + 18 leaves). The tree walk below counts
+            // only leaves, so make it the single source of truth by resetting first.
+            _passedTests = 0;
+            _failedTests = 0;
+            _skippedTests = 0;
+            _inconclusiveTests = 0;
+
             ProcessTestResults(result);
-            
+
             Debug.Log($"[TEST-EXPORT] Test run finished at {_runEndTime:yyyy-MM-dd HH:mm:ss}");
             Debug.Log($"[TEST-EXPORT] Results - Passed: {_passedTests}, Failed: {_failedTests}, Skipped: {_skippedTests}");
             
@@ -98,6 +109,15 @@ namespace PerSpec.Editor.TestExport
         
         public void TestFinished(ITestResultAdaptor result)
         {
+            // This callback fires for suite nodes as well as individual tests. Storing a
+            // suite here would make CreateTestSuiteFromResults emit it as a <test-case>,
+            // which inflates the count and makes the file fail content verification.
+            // Use the same leaf definition as ProcessTestResults.
+            if (result.HasChildren)
+            {
+                return;
+            }
+
             var testResult = new TestResult
             {
                 FullName = result.Test.FullName,
