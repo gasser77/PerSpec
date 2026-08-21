@@ -82,6 +82,45 @@ def _dotnet_ticks_now() -> int:
     # DateTime.Ticks is 100-nanosecond intervals; preserve microsecond precision.
     return delta.days * 864_000_000_000 + delta.seconds * 10_000_000 + delta.microseconds * 10
 
+
+# The statuses at which a request is finished, for good or ill. Mirrors
+# TestCoordinatorEditor.TerminalStatuses on the C# side. Anything else means the run is
+# still in flight - or wedged - and has produced no verdict yet.
+TERMINAL_STATUSES = frozenset({
+    'completed', 'failed', 'cancelled', 'timeout', 'inconclusive', 'no_match'
+})
+
+# Terminal statuses that mean "the requested tests did not run". A caller must never be
+# able to read one of these as a pass.
+UNSUCCESSFUL_STATUSES = frozenset({
+    'failed', 'timeout', 'inconclusive', 'cancelled', 'no_match'
+})
+
+
+def parse_db_timestamp(value):
+    """Parse a created_at/started_at/last_heartbeat that may be .NET ticks or ISO text.
+
+    Unity writes INT64 ticks (sqlite-net defaults to StoreDateTimeAsTicks); some Python
+    paths write ISO text. Returns a NAIVE local datetime, or None when the value cannot be
+    read at all.
+
+    Module level on purpose: test_results.py needs this to decide which result files could
+    possibly belong to a request, and must not reach into a private method to get it.
+    """
+    from datetime import datetime as _dt, timedelta as _td
+    if isinstance(value, (int, float)):
+        # .NET DateTime.Ticks - 100-ns intervals since 0001-01-01.
+        try:
+            return _DOTNET_EPOCH + _td(microseconds=int(value) // 10)
+        except (OverflowError, ValueError):
+            return None
+    try:
+        text = str(value).replace('Z', '')
+        return _dt.fromisoformat(text)
+    except (TypeError, ValueError):
+        return None
+
+
 class TestCoordinator:
     def __init__(self):
         self.db_path = Path(get_db_path())
@@ -189,7 +228,7 @@ class TestCoordinator:
 
         A request is considered fully complete when BOTH:
           1. The DB row has a terminal status ('completed', 'failed', 'cancelled',
-             'timeout', 'inconclusive'), AND
+             'timeout', 'inconclusive', 'no_match'), AND
           2. A matching results XML file is present in PerSpec/TestResults/. If
              only Unity's AppData copy exists, this method imports it into
              PerSpec/TestResults/ before returning.
@@ -214,7 +253,7 @@ class TestCoordinator:
             UnityNotRespondingError: the editor stopped checking in mid-flight
             TimeoutError: the run did not finish within ``timeout``
         """
-        terminal_statuses = {'completed', 'failed', 'cancelled', 'timeout', 'inconclusive'}
+        terminal_statuses = TERMINAL_STATUSES
         start_time = time.time()
         last_status = None
         consecutive_misses = 0
@@ -284,6 +323,14 @@ class TestCoordinator:
                 unity_silent_since = None
 
             if status['status'] in terminal_statuses:
+                # 'no_match' means the filter selected nothing, so no test ran and no XML
+                # will ever exist for this request. Waiting for one only burns the grace
+                # period, and picking up whatever is newest is precisely how another run's
+                # results get attributed to this one.
+                if status['status'] == 'no_match':
+                    status['results_xml'] = None
+                    return status
+
                 # Carry the results file out with the status so callers can check that
                 # what ran is what was asked for, rather than trusting the row alone.
                 status['results_xml'] = self._await_results_xml(
@@ -372,19 +419,12 @@ class TestCoordinator:
 
     @staticmethod
     def _parse_request_timestamp(value):
-        """Parse a created_at value that may be .NET ticks (int) or ISO text."""
-        from datetime import datetime as _dt, timedelta as _td
-        if isinstance(value, (int, float)):
-            # .NET DateTime.Ticks - 100-ns intervals since 0001-01-01.
-            try:
-                return _DOTNET_EPOCH + _td(microseconds=int(value) // 10)
-            except (OverflowError, ValueError):
-                return None
-        try:
-            text = str(value).replace('Z', '')
-            return _dt.fromisoformat(text)
-        except (TypeError, ValueError):
-            return None
+        """Parse a created_at value that may be .NET ticks (int) or ISO text.
+
+        Kept as a thin alias so every existing call site stays put; the implementation
+        lives at module level as parse_db_timestamp() so other scripts can use it.
+        """
+        return parse_db_timestamp(value)
 
     def get_test_results(self, request_id: int) -> List[Dict]:
         """
@@ -489,7 +529,7 @@ class TestCoordinator:
             cursor.execute("""
                 SELECT * FROM test_requests
                 WHERE status NOT IN (
-                    'completed', 'failed', 'cancelled', 'timeout', 'inconclusive'
+                    'completed', 'failed', 'cancelled', 'timeout', 'inconclusive', 'no_match'
                 )
                 ORDER BY created_at ASC
             """)
@@ -626,6 +666,12 @@ class TestCoordinator:
         if not status:
             return None
 
+        # Nothing ran, so there is nothing of this request's to verify. Any file on disk
+        # belongs to some other run, and reporting it here reads as a statement about this
+        # one.
+        if status['status'] == 'no_match':
+            return None
+
         if xml_path is None:
             results_dir = Path(get_project_root()) / "PerSpec" / "TestResults"
             if not results_dir.exists():
@@ -693,9 +739,13 @@ class TestCoordinator:
                         if test['error_message']:
                             print(f"     {test['error_message']}")
 
-        elif status['status'] in ('failed', 'timeout', 'inconclusive'):
+        elif status['status'] in UNSUCCESSFUL_STATUSES:
             if status['error_message']:
                 print(f"\n[ERROR] {status['error_message']}")
+
+            if status['status'] == 'no_match':
+                print("\nNo test ran, so there are no results for this request.")
+                print("Retrying will not help - correct the name and submit again.")
 
         print("="*60 + "\n")
 
@@ -711,29 +761,41 @@ class TestCoordinator:
             print(f"  {verification.reason}")
             if verification.suggested_filter:
                 print(f"  Try: {verification.suggested_filter}")
-            print("  The request has been marked 'inconclusive' - the requested tests did not run.")
+
+            miss_status = verification.miss_status
+            print(f"  The request has been marked '{miss_status}' - the requested tests did not run.")
             print("!"*60 + "\n")
 
-            self._mark_inconclusive(request_id, verification.reason)
+            self._mark_missed(request_id, miss_status, verification.reason)
             return False
 
-        # 'inconclusive' means the run produced no usable evidence either way. A caller
-        # must not be able to read that as a pass, so it is not a success here.
-        return status['status'] not in ('failed', 'timeout', 'inconclusive', 'cancelled')
+        # None of these mean the requested tests passed, so none of them may read as one.
+        return status['status'] not in UNSUCCESSFUL_STATUSES
 
-    def _mark_inconclusive(self, request_id: int, reason: str):
-        """Downgrade a request that reported completion it cannot support."""
+    def _mark_missed(self, request_id: int, status: str, reason: str):
+        """Downgrade a request that reported completion it cannot support.
+
+        'no_match' when tests ran but not one of them was this filter's - a wrong name,
+        which the caller can fix. 'inconclusive' when nothing ran at all.
+        """
         conn = self._get_connection()
         try:
             cursor = conn.cursor()
             cursor.execute("""
                 UPDATE test_requests
-                SET status = 'inconclusive', error_message = ?
+                SET status = ?, error_message = ?
                 WHERE id = ?
-            """, (reason, request_id))
+            """, (status, reason, request_id))
             conn.commit()
         except sqlite3.Error as e:
-            print(f"[WARN] Could not mark request {request_id} inconclusive: {e}")
+            print(f"[WARN] Could not mark request {request_id} {status}: {e}")
+
+            # An older database rejects 'no_match' outright. A wrong-but-terminal status
+            # beats leaving a green row that the results do not support.
+            if status != 'inconclusive':
+                print("[WARN] Run db_update_status_constraint.py to allow 'no_match'. "
+                      "Falling back to 'inconclusive'.")
+                self._mark_missed(request_id, 'inconclusive', reason)
         finally:
             conn.close()
 

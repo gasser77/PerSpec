@@ -113,6 +113,20 @@ class XmlVerification:
         """The run demonstrably executed nothing for this filter."""
         return self.verdict in (EMPTY, NONE)
 
+    @property
+    def is_filter_miss(self) -> bool:
+        """Tests ran and not one belongs to this filter - so the filter names nothing.
+
+        Distinct from EMPTY, where nothing ran at all and a broken run explains it just
+        as well as a wrong name.
+        """
+        return self.verdict == NONE
+
+    @property
+    def miss_status(self) -> str:
+        """Terminal status to record for a definitive miss."""
+        return 'no_match' if self.is_filter_miss else 'inconclusive'
+
     def __bool__(self):
         return self.can_adopt
 
@@ -227,13 +241,23 @@ def describe_names(names: List[str], limit: int = 3) -> str:
     return sample + (", ..." if len(names) > limit else "")
 
 
-def describe_classes(names: List[str], limit: int = 4) -> str:
-    """The distinct classes present in a set of NUnit full names."""
+def distinct_classes(names: List[str]) -> List[str]:
+    """Owning classes present in a set of NUnit full names, in first-seen order.
+
+    One place for the class-derivation rule, so the results viewer and the coordinator's
+    summary can never disagree about whose run a file is.
+    """
     classes = []
     for name in names:
         cls = name.rsplit(".", 1)[0] if "." in name else name
-        if cls not in classes:
+        if cls and cls not in classes:
             classes.append(cls)
+    return classes
+
+
+def describe_classes(names: List[str], limit: int = 4) -> str:
+    """The distinct classes present in a set of NUnit full names."""
+    classes = distinct_classes(names)
 
     if not classes:
         return "(none)"

@@ -4,10 +4,15 @@ Quick Test Runner - Simple interface for common test operations
 
 Exit codes:
   0  the run finished and its results are the results you asked for
-  1  general error, cancellation, or the run failed / timed out
+  1  general error, cancellation, or the run failed
   2  compilation errors - the tests could not run
   3  the run reported completion but its results do not match the requested filter
   4  the Unity Editor is not responding (restarting, importing, or closed)
+  5  the wait timed out - the run never finished and produced NO results at all.
+     Nothing on disk belongs to this request, so do not read `test_results.py latest`:
+     it will show an older run. Use `test_results.py latest --for-request <id>`.
+  6  the filter matched no tests - nothing ran. The name is wrong, not the tests.
+     Retrying will not help; check the namespace/class/method name in the message.
 """
 
 
@@ -271,8 +276,38 @@ def main():
                               "importing. Request "
                               f"{request_id} is still queued and will run when it is back.")
                         sys.exit(4)
+                    except TimeoutError as e:
+                        # wait_for_completion gives up without touching the row, so the
+                        # request is still in flight and NOTHING was written for it. This
+                        # used to fall into the catch-all below as a one-line "Error:",
+                        # after which `test_results.py latest` cheerfully showed the
+                        # PREVIOUS class's green run - the run actually asked for having
+                        # produced no results at all.
+                        current = coordinator.get_request_status(request_id) or {}
+                        current_status = current.get('status', 'unknown')
+
+                        print("\n" + "!" * 60)
+                        print(f"[TIMEOUT] {e}")
+                        print(f"[TIMEOUT] NO results were produced for request {request_id}.")
+                        print(f"  It is still status '{current_status}' "
+                              f"({coordinator.describe_age(current.get('created_at'))}).")
+                        print("  Nothing was written to PerSpec/TestResults for this run, so")
+                        print("  'test_results.py latest' will show an OLDER run's results.")
+                        print("  Do not read them as this run's.")
+                        print("!" * 60)
+                        print("\nNext steps:")
+                        print("  python PerSpec/Coordination/Scripts/test_results.py latest "
+                              f"--for-request {request_id}")
+                        print("  python PerSpec/Coordination/Scripts/quick_test.py stuck --repair")
+                        sys.exit(5)
 
                     if not coordinator.print_summary(request_id, status.get('results_xml')):
+                        # A filter that matched nothing is a caller mistake, not a failing
+                        # suite. It gets its own code so a script can tell "you typed the
+                        # name wrong" apart from "the tests are red" and stop retrying.
+                        if status.get('status') == 'no_match':
+                            sys.exit(6)
+
                         # Either the run failed outright, or its results were not the
                         # results that were asked for. Both must be non-zero.
                         sys.exit(3 if status.get('status') == 'completed' else 1)
