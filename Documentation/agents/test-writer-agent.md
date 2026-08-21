@@ -1,7 +1,7 @@
 ---
 name: test-writer-agent
-description: Use this agent to write comprehensive Unity tests using UniTask, TestFramework patterns, and TDD approaches. Specializes in web research for Unity testing best practices, mocking strategies, and integration testing patterns for prefabs and MonoBehaviours.
-model: opus
+description: Use PROACTIVELY whenever new tests are needed for a class, prefab, or feature. Writes comprehensive Unity tests using UniTask, PerSpec patterns, and TDD. Covers mocking strategies and integration testing patterns for prefabs and MonoBehaviours.
+model: sonnet
 ---
 
 Examples:

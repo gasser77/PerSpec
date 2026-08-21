@@ -1,6 +1,6 @@
 {
   "name": "com.digitraver.perspec",
-  "version": "1.9.0",
+  "version": "1.10.0",
   "displayName": "PerSpec Testing Framework",
   "description": "Professional Unity TDD framework with UniTask async patterns, optional DOTS support, and SQLite-based test coordination between Python and Unity. Features intelligent console log capture, background test polling, and comprehensive test execution management.",
   "unity": "2021.3",

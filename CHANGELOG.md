@@ -5,6 +5,61 @@ All notable changes to the PerSpec Testing Framework will be documented in this 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.10.0] - 2026-08-21
+
+### Added
+- **Five generalized Unity subagents**
+  - `unity-log-triage` (`haiku`) owns `monitor_editmode_logs.py` and `test_playmode_logs.py`
+    in all their forms. Returns the distinct errors, their counts, and first occurrence -
+    not the log. Knows that PlayMode capture is sampled every 5 seconds, so a missing line
+    is not proof an event did not happen.
+  - `unity-test-runner` (`haiku`) owns the refresh, verify, run loop. Stops and reports if
+    compilation errors exist instead of running anyway, keeps `--timeout` at 300s or above,
+    and returns pass/fail **sets** rather than counts so runs can be compared to each other.
+  - `unity-scene-inspector` (`sonnet`) owns every scene, prefab, and asset content
+    question, answered through `scene_hierarchy.py`. Megabytes of JSON in, one line out.
+  - `unity-codebase-scout` (`sonnet`) handles find-usages and find-implementations across a
+    large project, and always reports which roots it actually searched.
+  - `unity-asmdef-doctor` (`haiku`) diagnoses assembly definition wiring, including the
+    signature where a `MenuItem` in a runtime assembly never registers and `quick_menu.py`
+    reports that as a timeout rather than as "not found".
+- **"Analyze with the export, never by reading YAML" rule in `LLM.md`**
+  - The hierarchy export is now documented as the supported way to inspect scene and
+    prefab contents. It resolves GUIDs and fileIDs, applies prefab overrides, and honours
+    `m_RemovedComponents`, so it reports what the scene actually contains. Reading raw
+    `.unity` or `.prefab` YAML burns hundreds of thousands of lines of context for an
+    answer the export hands over in one field.
+  - Covers scoping the export narrowly, finding the answer with `grep -n` rather than
+    `cat`, leaving `--show` off, and what to do when the export genuinely cannot answer.
+- **Model tier table in `LLM.md`**
+  - Documents when to pick `haiku`, `sonnet`, or `opus`, with relative cache-read cost, so
+    tier choice is a recorded decision rather than a default.
+- **Standing delegation authorization in `LLM.md`**
+  - States plainly that the user has pre-authorized delegation, so a subagent does not need
+    to be requested per task. Paired with a positive trigger list and a short "handle inline"
+    list.
+
+### Changed
+- **Five agents retiered off `opus`**
+  - `test-coordination-agent` to `haiku`; `batch-refactor-agent`, `architecture-agent`,
+    `test-writer-agent`, and `refactor-agent` to `sonnet`.
+  - `dots-performance-profiler` stays on `opus`. Burst and job-dependency analysis is
+    genuine reasoning, not volume work.
+  - Every tool call re-reads the whole context, so cost tracks context size multiplied by
+    call count. Agents pinned to the top tier for mechanical work were paying top-tier cache
+    reads for work with no judgment in it.
+- **All agent `description:` fields rewritten**
+  - Each now leads with an imperative and names its trigger condition
+    ("Use PROACTIVELY whenever ..."). The previous passive "Use this agent to ..." phrasing
+    is rarely picked by automatic agent selection, so the tier settings were never exercised.
+- **`LLM.md` agent section replaced**
+  - The "Score 1-3 / 4-7 / 8+" decision matrix, the "When to Use Agents" table with its
+    explicit NO rows, and the `Task(...)` pseudo-code examples are gone. They set the bar at
+    "complex feature, 5+ files", which almost no daily task clears, so delegation never
+    happened.
+  - The `Available Agents` list is now a table of all eleven agents with their tier. It
+    previously omitted `test-coordination-agent`, which existed as a file the whole time.
+
 ## [1.9.0] - 2026-08-13
 
 ### Added

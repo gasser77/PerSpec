@@ -361,31 +361,84 @@ python PerSpec/Coordination/Scripts/monitor_editmode_logs.py --errors
 
 ## 🤖 Agent Usage
 
-### Decision Matrix
-- **Score 1-3**: NO agents - direct edits only
-- **Score 4-7**: ONE specialized agent
-- **Score 8+**: MULTIPLE agents in PARALLEL
+### Standing authorization
 
-### When to Use Agents
-| Task | Use Agent? | Example |
-|------|------------|---------|
-| Complex feature (5+ files) | ✅ YES | "Implement auth system" |
-| Test suite creation | ✅ YES | "Write comprehensive tests" |
-| Simple fix | ❌ NO | "Fix null reference" |
-| View file | ❌ NO | "Show Player class" |
+The user has already authorized delegation. Do **not** ask permission before
+spawning a subagent. Every trigger in the list below counts as a request the
+user has already made. Delegation is the default for bulk work, not an
+escalation.
 
-### Agent Patterns
-```python
-# Complex feature - PARALLEL execution
-Task(test-writer-agent): "Create test suite for inventory system"
-Task(refactor-agent): "Prepare existing code for inventory"
+Why this matters: every tool call re-reads the entire context, so cost tracks
+context size multiplied by call count. A subagent reads on its own budget and
+hands back a summary, so the main thread stops growing.
 
-# Simple tasks - NO AGENTS
-Edit: Fix null check on line 42
-Read: Show PlayerController
-```
+### Delegate by default (do not ask first)
+
+- Web research of any kind
+- Any search that will touch more than three files
+- Any question about scene or prefab contents - export the hierarchy, do not read YAML
+- Log triage and error filtering
+- Running the test loop and reporting results
+- Generating or updating documentation
+
+### Handle inline
+
+- A single targeted edit to a file already in context
+- Answering from information already in the conversation
+- Anything the user is watching step by step
+
+### Model tiers
+
+Pick the tier from the shape of the work, not from the importance of the outcome.
+
+| Tier | Use for | Relative cache-read cost |
+|------|---------|--------------------------|
+| `haiku` | Running scripts, polling, filtering logs, mechanical text transforms. No judgment. | 1x |
+| `sonnet` | High-volume reading with a small answer. Search, inspection, doc generation, routine test authoring. | 2x |
+| `opus` | Design judgment, concurrency reasoning, root-causing a bug that has already resisted one attempt. | 5x |
+
+**Rule of thumb:** if a task's output is much smaller than its input, it belongs
+in a subagent, and usually on `haiku` or `sonnet`.
+
+Do not lower a tier on work where a wrong answer is expensive to detect. A cheap
+subagent that quietly returns a wrong result costs more than it saves.
+
+### A subagent returns a summary, not a transcript
+
+The whole point is keeping bulk out of the main thread. A subagent that pastes
+back every file it read, or the full log it just filtered, has saved nothing and
+cost more than doing the work inline. Return findings, counts, file paths, and
+line numbers.
 
 ## 🌳 Scene Hierarchy Export
+
+### Analyze with the export, never by reading YAML
+
+**The export is the supported way to inspect scene and prefab contents.** Do not
+open `.unity`, `.prefab`, or `.asset` files and read the raw YAML. Export the
+hierarchy and read the JSON.
+
+Why the export wins:
+- It resolves GUIDs and fileIDs for you. The JSON carries real component type
+  names and real serialized values, so there is nothing left to look up by hand.
+- It has already applied prefab overrides and `m_RemovedComponents`, so what you
+  read is what the scene actually contains, not what the prefab claims.
+- Raw scene YAML runs to hundreds of thousands of lines. Reading it burns context
+  for an answer the export hands over in one field.
+
+How to do it:
+1. Export the narrowest scope that answers the question. Use
+   `export object <path>` over `export full` whenever you know the branch.
+2. Find the answer in the JSON with `grep -n`, then read a small window around the
+   hit with `sed -n`. Do not `cat` the export.
+3. Leave `--show` off unless the user asked to see the JSON. It prints everything.
+
+Delegate this to **unity-scene-inspector** (`sonnet`). Megabytes of JSON in, one
+line out, and none of it lands in the main thread.
+
+If the export genuinely cannot answer the question - a broken reference with no
+resolvable target, or an asset Unity refuses to load - say so and ask before
+falling back to raw YAML.
 
 ### Export Unity Scene to JSON
 ```bash
@@ -876,11 +929,22 @@ TestFramework/
   - `sessions` - List all sessions
 
 ### Available Agents
-- **test-writer-agent**: Comprehensive tests with TDD
-- **refactor-agent**: Split large files, SOLID
-- **batch-refactor-agent**: Batch C# processing
-- **dots-performance-profiler**: DOTS/ECS analysis
-- **architecture-agent**: Document architecture
+
+Defined in `{package_path}/Documentation/agents/` and copied to `.claude/agents/`.
+
+| Agent | Tier | Use for |
+|-------|------|---------|
+| **unity-log-triage** | `haiku` | Run the log scripts, return distinct errors with counts. Not the log. |
+| **unity-test-runner** | `haiku` | Own the refresh → check errors → run loop. Returns pass/fail sets. |
+| **unity-asmdef-doctor** | `haiku` | Assembly definition diagnosis: missing references, wrong assembly. |
+| **test-coordination-agent** | `haiku` | Drive test execution through the SQLite request queue. |
+| **unity-scene-inspector** | `sonnet` | Narrow questions about scene and prefab contents via hierarchy export. |
+| **unity-codebase-scout** | `sonnet` | Find-usages and find-implementations across a large project. |
+| **test-writer-agent** | `sonnet` | Comprehensive tests with TDD and UniTask patterns. |
+| **refactor-agent** | `sonnet` | Split large files, extract interfaces, SOLID. |
+| **batch-refactor-agent** | `sonnet` | Batch C# processing across many files. |
+| **architecture-agent** | `sonnet` | Document architecture, find redundancies. |
+| **dots-performance-profiler** | `opus` | Burst, job dependencies, allocator analysis. Real reasoning. |
 
 ## 📝 Critical Reminders
 

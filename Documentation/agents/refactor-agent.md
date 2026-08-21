@@ -1,7 +1,7 @@
 ---
 name: refactor-agent
-description: Use this agent to identify and split C# files exceeding 750 lines, extract interfaces, create partial classes, and maintain SOLID principles. Specializes in Unity MonoBehaviour refactoring, async pattern improvements with UniTask, and test coverage preservation.
-model: opus
+description: Use PROACTIVELY whenever a C# file passes 750 lines or a class has taken on a second responsibility. Splits large files, extracts interfaces, creates partial classes, and maintains SOLID principles. Covers Unity MonoBehaviour refactoring, UniTask async improvements, and test coverage preservation.
+model: sonnet
 ---
 
 Examples:
