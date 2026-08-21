@@ -269,11 +269,13 @@ namespace PerSpec.Editor.Coordination
 
                 // Nothing executed, or nothing that belongs to this request. Either way this is
                 // not evidence the requested tests passed - it must never be reported as green.
+                // 'no_match' when tests ran but none were this filter's (a wrong name, which
+                // the caller can fix); 'inconclusive' when nothing ran at all.
                 if (verification.IsDefinitiveMiss)
                 {
                     Debug.LogWarning($"[PlayModeTestCompletionChecker] {verification.Reason}");
 
-                    FinalizeRequest(dbManager, request, "inconclusive", 0, 0, 0, 0, duration,
+                    FinalizeRequest(dbManager, request, verification.MissStatus, 0, 0, 0, 0, duration,
                         verification.Reason);
                     return;
                 }

@@ -13,9 +13,11 @@ namespace PerSpec.Editor.Services
         #region Fields
         
         private static SQLiteManager _dbManager;
-        private static TestExecutor _testExecutor;
-        private static bool _isRunningTests = false;
-        private static int _currentRequestId = -1;
+        // Run state lives in TestCoordinatorEditor, which owns the only dispatcher. A second
+        // copy here is what let this service start a run the coordinator believed was not
+        // happening.
+        private static bool _isRunningTests => PerSpec.Editor.Coordination.TestCoordinatorEditor.IsRunningTests;
+        private static int _currentRequestId => PerSpec.Editor.Coordination.TestCoordinatorEditor.CurrentRequestId;
         private static bool _pollingEnabled = true;
         
         #endregion
@@ -52,8 +54,9 @@ namespace PerSpec.Editor.Services
         {
             try
             {
+                // No TestExecutor here: TestCoordinatorEditor owns the only one. Building a
+                // second created a second TestRunnerApi ScriptableObject that nothing ran.
                 _dbManager = new SQLiteManager();
-                _testExecutor = new TestExecutor(_dbManager);
                 Debug.Log("[TestCoordination] Service initialized");
             }
             catch (Exception e)
@@ -98,10 +101,12 @@ namespace PerSpec.Editor.Services
         {
             if (_isRunningTests && _currentRequestId > 0)
             {
-                _dbManager.UpdateRequestStatus(_currentRequestId, "cancelled", "Cancelled by user");
-                _isRunningTests = false;
-                _currentRequestId = -1;
-                Debug.Log($"[TestCoordination] Cancelled test request {_currentRequestId}");
+                // The coordinator owns the run and its terminal write. Cancelling here as
+                // well would race it, and the old code logged the id AFTER clearing it, so
+                // it always said "Cancelled test request -1".
+                int cancelledId = _currentRequestId;
+                PerSpec.Editor.Coordination.TestCoordinatorEditor.CancelCurrentTest();
+                Debug.Log($"[TestCoordination] Cancelled test request {cancelledId}");
                 return true;
             }
             return false;
@@ -168,73 +173,18 @@ namespace PerSpec.Editor.Services
         
         #region Private Methods
         
+        /// <summary>
+        /// Hands the request to the one real dispatcher.
+        ///
+        /// This used to be a parallel implementation with its own filter builder, its own
+        /// run-state flags, and no pre-flight check. It always used testNames - even for a
+        /// class run, which testNames can never match - so a class dispatched from the
+        /// Control Center silently ran nothing. It also skipped the "Both" platform
+        /// rejection and could start a run while the coordinator believed none was active.
+        /// </summary>
         private static void ProcessTestRequest(TestRequest request)
         {
-            _isRunningTests = true;
-            _currentRequestId = request.Id;
-            
-            try
-            {
-                // Update status
-                _dbManager.UpdateRequestStatus(request.Id, "running");
-                
-                // Create filter
-                var filter = CreateTestFilter(request);
-                
-                // Execute tests
-                _testExecutor.ExecuteTests(request, filter, OnTestComplete);
-                
-                Debug.Log($"[TestCoordination] Executing tests for request {request.Id}");
-            }
-            catch (Exception e)
-            {
-                Debug.LogError($"[TestCoordination] Error processing request: {e.Message}");
-                _dbManager.UpdateRequestStatus(request.Id, "failed", e.Message);
-                _isRunningTests = false;
-                _currentRequestId = -1;
-            }
-        }
-        
-        private static UnityEditor.TestTools.TestRunner.Api.Filter CreateTestFilter(TestRequest request)
-        {
-            var filter = new UnityEditor.TestTools.TestRunner.Api.Filter();
-            
-            // Set test mode
-            if (request.TestPlatform == "EditMode")
-                filter.testMode = UnityEditor.TestTools.TestRunner.Api.TestMode.EditMode;
-            else if (request.TestPlatform == "PlayMode")
-                filter.testMode = UnityEditor.TestTools.TestRunner.Api.TestMode.PlayMode;
-            
-            // Apply filters
-            if (!string.IsNullOrEmpty(request.TestFilter))
-            {
-                filter.testNames = new[] { request.TestFilter };
-            }
-            
-            return filter;
-        }
-        
-        private static void OnTestComplete(TestRequest request, bool success, string error, TestResultSummary summary)
-        {
-            if (success && summary != null)
-            {
-                _dbManager.UpdateRequestResults(
-                    request.Id,
-                    "completed",
-                    summary.TotalTests,
-                    summary.PassedTests,
-                    summary.FailedTests,
-                    summary.SkippedTests,
-                    summary.Duration
-                );
-            }
-            else
-            {
-                _dbManager.UpdateRequestStatus(request.Id, "failed", error);
-            }
-            
-            _isRunningTests = false;
-            _currentRequestId = -1;
+            PerSpec.Editor.Coordination.TestCoordinatorEditor.ProcessTestRequest(request);
         }
         
         #endregion

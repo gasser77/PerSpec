@@ -33,8 +33,12 @@ namespace PerSpec.Editor.Coordination
         private double _lastFileCheckTime;
         private const double FILE_CHECK_INTERVAL = 2.0; // Check every 2 seconds
         private const double FILE_STABILITY_WAIT = 3.0; // Wait for file to stabilize
-        private const double MAX_WAIT_TIME = 300.0; // 5 minute timeout for batch tests
-        private const double MAX_WAIT_TIME_INDIVIDUAL = 600.0; // 10 minute timeout for individual tests
+        // internal, not private: the stuck-run watchdog in TestCoordinatorEditor derives
+        // its own ceiling from these so the two cannot drift apart. It deliberately sits
+        // ABOVE them, because when this in-process monitor is alive it writes a far more
+        // precise record than the watchdog can.
+        internal const double MAX_WAIT_TIME = 300.0; // 5 minute timeout for batch tests
+        internal const double MAX_WAIT_TIME_INDIVIDUAL = 600.0; // 10 minute timeout for individual tests
         private const double MIN_RUN_SECONDS = 3.0; // Reject "completion" that fires within this many seconds of dispatch
         private bool _isMonitoring;
         private bool _hasCompletedViaCallback;
@@ -278,10 +282,11 @@ namespace PerSpec.Editor.Coordination
                     // handed them to us for this run. Even so, confirm they belong to the
                     // filter that was asked for. A run that executed nothing matching its
                     // filter must be inconclusive, never a green completion.
-                    string mismatchReason = DescribeFilterMismatch();
+                    string mismatchStatus;
+                    string mismatchReason = DescribeFilterMismatch(out mismatchStatus);
                     if (mismatchReason != null)
                     {
-                        _dbManager.UpdateRequestStatus(_currentRequest.Id, "inconclusive", mismatchReason);
+                        _dbManager.UpdateRequestStatus(_currentRequest.Id, mismatchStatus, mismatchReason);
                         _dbManager.LogExecution(_currentRequest.Id, "WARNING", "TestExecutor", mismatchReason);
                         Debug.LogWarning($"[TestExecutor] {mismatchReason}");
 
@@ -399,8 +404,10 @@ namespace PerSpec.Editor.Coordination
         /// This catches the case Unity itself cannot: a filter that resolves to zero tests
         /// still produces a clean, empty, "successful" run.
         /// </summary>
-        private string DescribeFilterMismatch()
+        private string DescribeFilterMismatch(out string terminalStatus)
         {
+            terminalStatus = null;
+
             if (_currentRequest == null)
             {
                 return null;
@@ -411,6 +418,11 @@ namespace PerSpec.Editor.Coordination
 
             if (_testResults.Count == 0)
             {
+                // Nothing ran at all. That is as consistent with a broken run or a failed
+                // compile as with a bad name, so this stays 'inconclusive' - 'no_match' is
+                // reserved for a filter demonstrably missing tests that DO exist.
+                terminalStatus = "inconclusive";
+
                 string target = string.IsNullOrEmpty(filter) ? "the requested tests" : $"'{filter}'";
                 return $"Test run finished without executing any tests for {target}. " +
                        "Check the filter is a fully qualified name and that the assembly compiled.";
@@ -430,10 +442,16 @@ namespace PerSpec.Editor.Coordination
                 return null;
             }
 
+            // Tests ran and none of them belong to this filter: the name is wrong, and the
+            // caller is the only one who can fix it. Say so with its own status.
+            terminalStatus = "no_match";
+
             string sample = string.Join(", ", _testResults.Keys.Take(3));
-            return $"Test run executed {_testResults.Count} test(s), none of which match " +
-                   $"{requestType} filter '{filter}'. Executed: {sample}" +
-                   (_testResults.Count > 3 ? ", ..." : string.Empty);
+            string suggestion = TestResultVerifier.SuggestQualifiedName(_testResults.Keys, filter);
+
+            return $"Filter '{filter}' matched 0 of the {_testResults.Count} test(s) that ran. " +
+                   $"Executed: {sample}" + (_testResults.Count > 3 ? ", ..." : string.Empty) +
+                   (string.IsNullOrEmpty(suggestion) ? string.Empty : $" Did you mean: {suggestion}");
         }
 
         private void ProcessTestResults(ITestResultAdaptor result)

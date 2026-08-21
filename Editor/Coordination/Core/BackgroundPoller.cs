@@ -35,6 +35,25 @@ namespace PerSpec.Editor.Coordination
         private static DateTime _postPendingSince = DateTime.MinValue;
         private const double POST_WATCHDOG_SECONDS = 30.0;
 
+        // The stuck-run watchdog needs a clock that keeps ticking while the editor is
+        // unfocused; EditorApplication.update is throttled there, which is the whole reason
+        // this class exists. This timer supplies the clock and the main thread supplies the
+        // execution - TickWatchdog touches SessionState, EditorPrefs and EditorApplication
+        // and can only legally run there.
+        private const int WATCHDOG_TICK_EVERY_N_POLLS = 15;   // ~15s at the 1s poll interval
+        private static int _watchdogTickCounter;
+        private static readonly SendOrPostCallback _watchdogPump = _ =>
+        {
+            try
+            {
+                TestCoordinatorEditor.TickWatchdog();
+            }
+            catch (Exception ex)
+            {
+                Debug.LogWarning($"[BackgroundPoller] Watchdog tick failed: {ex.Message}");
+            }
+        };
+
         static BackgroundPoller()
         {
             // Check if PerSpec is initialized
@@ -152,6 +171,15 @@ namespace PerSpec.Editor.Coordination
             if (!_isEnabled || !_perspecEnabledCache)
             {
                 return;
+            }
+
+            // Deliberately outside the _isProcessing gate below: the watchdog is idempotent
+            // and self-throttled on the main thread, and it must still tick while a dispatch
+            // Post is in flight - a wedged run is precisely the case where dispatch is stuck.
+            if (++_watchdogTickCounter >= WATCHDOG_TICK_EVERY_N_POLLS)
+            {
+                _watchdogTickCounter = 0;
+                _unitySyncContext?.Post(_watchdogPump, null);
             }
 
             if (_isProcessing)

@@ -80,6 +80,17 @@ namespace PerSpec.Editor.Coordination
         /// <summary>The run demonstrably executed nothing for this filter.</summary>
         public bool IsDefinitiveMiss =>
             Match == TestResultMatch.Empty || Match == TestResultMatch.None;
+
+        /// <summary>
+        /// Tests ran, and not one of them belongs to this filter - so the filter names
+        /// something that does not exist. That is a caller mistake ('no_match'), unlike
+        /// <see cref="TestResultMatch.Empty"/>, where nothing ran at all and a broken run
+        /// is just as likely an explanation ('inconclusive').
+        /// </summary>
+        public bool IsFilterMiss => Match == TestResultMatch.None;
+
+        /// <summary>Terminal status to record for a definitive miss.</summary>
+        public string MissStatus => IsFilterMiss ? "no_match" : "inconclusive";
     }
 
     /// <summary>
@@ -289,7 +300,112 @@ namespace PerSpec.Editor.Coordination
             }
         }
 
+        /// <summary>
+        /// Best guess at the fully qualified name the caller meant, given the names that
+        /// actually exist. Returns null when nothing is close enough to be worth printing.
+        ///
+        /// Two passes, exact before fuzzy, first hit wins. Feed names in a stable order
+        /// (tree or document order) so the answer is deterministic.
+        /// </summary>
+        public static string SuggestQualifiedName(IEnumerable<string> fullNames, string filter)
+        {
+            if (fullNames == null || string.IsNullOrEmpty(filter))
+            {
+                return null;
+            }
+
+            var candidates = fullNames.Where(n => !string.IsNullOrEmpty(n)).ToList();
+
+            // Pass 1 - the filter is a suffix of a real full name: the "forgot the
+            // namespace" mistake, which Unity's anchored groupNames regex silently
+            // matches zero tests for.
+            foreach (var fullName in candidates)
+            {
+                int index = fullName.IndexOf("." + filter + ".", StringComparison.Ordinal);
+                if (index >= 0)
+                {
+                    return fullName.Substring(0, index + 1 + filter.Length);
+                }
+
+                if (fullName.EndsWith("." + filter, StringComparison.Ordinal))
+                {
+                    return fullName;
+                }
+            }
+
+            // Pass 2 - same last segment, different namespace. Pass 1 cannot see this
+            // because a MIDDLE segment is wrong, so the filter is a suffix of nothing.
+            // This is the shape of the reported bug: TestProj.Modules.Tests.XTests
+            // asked for, TestProj.Core.Tests.XTests real.
+            // A nested-class filter may already use the '+' spelling, so split on both.
+            string leaf = LastSegment(filter);
+            if (string.IsNullOrEmpty(leaf))
+            {
+                return null;
+            }
+
+            foreach (var fullName in candidates)
+            {
+                int index = IndexOfSegment(fullName, leaf);
+                if (index >= 0)
+                {
+                    return fullName.Substring(0, index + leaf.Length);
+                }
+            }
+
+            return null;
+        }
+
         #region Helpers
+
+        /// <summary>The part of a name after its last '.' or '+' separator.</summary>
+        private static string LastSegment(string dottedName)
+        {
+            int lastSeparator = dottedName.LastIndexOfAny(new[] { '.', '+' });
+            return lastSeparator >= 0 ? dottedName.Substring(lastSeparator + 1) : dottedName;
+        }
+
+        /// <summary>
+        /// Finds <paramref name="segment"/> inside <paramref name="fullName"/> only where it
+        /// occupies a whole segment, so "Tests" never matches inside "MyTests".
+        /// Case-insensitive, so a casing typo is caught too.
+        ///
+        /// '+' is a boundary as well as '.', because NUnit writes a nested class as
+        /// Ns.Outer+Inner - and a caller who writes Ns.Outer.Inner is exactly the person who
+        /// needs to be told the real spelling. A trailing '(' is a boundary too, for
+        /// parameterised cases written Ns.Class.Method(1,2).
+        /// </summary>
+        private static int IndexOfSegment(string fullName, string segment)
+        {
+            int from = 0;
+            while (from <= fullName.Length - segment.Length)
+            {
+                int index = fullName.IndexOf(segment, from, StringComparison.OrdinalIgnoreCase);
+                if (index < 0)
+                {
+                    return -1;
+                }
+
+                bool startIsBoundary = index == 0
+                                       || fullName[index - 1] == '.'
+                                       || fullName[index - 1] == '+';
+
+                int after = index + segment.Length;
+                bool endIsBoundary = after == fullName.Length
+                                     || fullName[after] == '.'
+                                     || fullName[after] == '+'
+                                     || fullName[after] == '(';
+
+                if (startIsBoundary && endIsBoundary)
+                {
+                    return index;
+                }
+
+                from = index + 1;
+            }
+
+            return -1;
+        }
 
         private static string GetFullName(XElement testCase)
         {
@@ -333,34 +449,9 @@ namespace PerSpec.Editor.Coordination
             }
         }
 
-        /// <summary>
-        /// When a filter matched nothing, look for a test whose full name ends with the filter.
-        /// This is the common "forgot the namespace" mistake, which Unity's anchored groupNames
-        /// regex silently matches zero tests for.
-        /// </summary>
         private static string SuggestQualifiedName(List<XElement> cases, string filter)
         {
-            foreach (var testCase in cases)
-            {
-                string fullName = GetFullName(testCase);
-                if (string.IsNullOrEmpty(fullName))
-                {
-                    continue;
-                }
-
-                int index = fullName.IndexOf("." + filter + ".", StringComparison.Ordinal);
-                if (index >= 0)
-                {
-                    return fullName.Substring(0, index + 1 + filter.Length);
-                }
-
-                if (fullName.EndsWith("." + filter, StringComparison.Ordinal))
-                {
-                    return fullName;
-                }
-            }
-
-            return null;
+            return SuggestQualifiedName(cases.Select(GetFullName), filter);
         }
 
         private static string DescribeSample(List<XElement> cases)

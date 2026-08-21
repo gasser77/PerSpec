@@ -20,6 +20,12 @@ namespace PerSpec.Editor.Coordination
         private static double _lastCheckTime;
         private static double _checkInterval = 1.0; // Check every 1 second
         private static bool _isRunningTests = false;
+
+        /// <summary>True from the moment a request is claimed until its run reaches a terminal state.</summary>
+        public static bool IsRunningTests => _isRunningTests;
+
+        /// <summary>Id of the request currently claimed, or -1.</summary>
+        public static int CurrentRequestId => _currentRequestId;
         private static SQLiteManager _dbManager;
         private static TestExecutor _testExecutor;
         private static int _currentRequestId = -1;
@@ -36,7 +42,7 @@ namespace PerSpec.Editor.Coordination
         // Statuses that must never be overwritten once written.
         private static readonly HashSet<string> TerminalStatuses = new HashSet<string>
         {
-            "completed", "failed", "cancelled", "timeout", "inconclusive"
+            "completed", "failed", "cancelled", "timeout", "inconclusive", "no_match"
         };
 
         // SessionState survives domain reloads (but not editor restarts), which is exactly
@@ -45,12 +51,42 @@ namespace PerSpec.Editor.Coordination
         private const string SessionKeyDispatchTicks = "PerSpec.TestRun.DispatchTicks";
         private const string SessionKeyRetryCount = "PerSpec.TestRun.RetryCount";
         private const string SessionKeyPlatform = "PerSpec.TestRun.Platform";
+
+        // Set only while the filter is being resolved and no run has started yet. A reload
+        // in that window is not an interrupted run - there is no XML to hunt for and no
+        // PlayMode completion checker to wait on.
+        private const string SessionKeyPreflight = "PerSpec.TestRun.Preflight";
         private const int MaxReloadRetries = 1;
 
         // How long to let PlayModeTestCompletionChecker finish a PlayMode run before the
         // interruption ladder takes over. Entering play mode always triggers a domain reload,
         // so that reload must not be mistaken for a crash.
         private const double PlayModeReconcileDelaySeconds = 15.0;
+
+        // --- Stuck-run watchdog --------------------------------------------------------
+        // TestExecutor's MAX_WAIT_TIME monitor lives on EditorApplication.update and dies
+        // with the domain reload that entering PlayMode ALWAYS causes, so a PlayMode run
+        // has no in-process timeout at all. PlayModeTestCompletionChecker only fires on
+        // EnteredEditMode, so a run that never leaves PlayMode is never finalised. And
+        // RecoverOrphanedRequests runs only from the static constructor, i.e. only on a
+        // domain reload - which a wedged PlayMode run never triggers.
+        //
+        // This sweep is the backstop that keeps the promise: no request stays non-terminal
+        // forever.
+        private const double WatchdogSweepIntervalSeconds = 30.0;
+        private const double WatchdogGraceSeconds = 300.0;  // margin over TestExecutor's ceiling
+        private const double WatchdogFloorSeconds = 120.0;  // lowest ceiling an override may set
+
+        private const string PrefWatchdogEnabled = "PerSpec_Watchdog_Enabled";
+        private const string PrefWatchdogTimeoutSeconds = "PerSpec_Watchdog_TimeoutSeconds"; // 0 = auto
+        private const string PrefWatchdogStopPlayMode = "PerSpec_Watchdog_StopPlayMode";
+
+        private static double _lastWatchdogSweepTime;
+
+        // Requests this session has already driven to a terminal status. Entries are added
+        // only after the write is confirmed, so a locked database is retried rather than
+        // silently abandoned for the rest of the session.
+        private static readonly HashSet<int> _watchdogHandled = new HashSet<int>();
 
         static TestCoordinatorEditor()
         {
@@ -84,6 +120,10 @@ namespace PerSpec.Editor.Coordination
                 
                 // Initialize last check time
                 _lastCheckTime = EditorApplication.timeSinceStartup;
+
+                // First sweep is one full interval away: the static constructor is about to
+                // run RecoverOrphanedRequests, which covers everything a sweep would find.
+                _lastWatchdogSweepTime = _lastCheckTime;
                 
                 // Set up background polling if enabled
                 if (_useBackgroundPolling)
@@ -149,6 +189,7 @@ namespace PerSpec.Editor.Coordination
                 SessionState.EraseInt(SessionKeyActiveRequestId);
                 SessionState.EraseString(SessionKeyDispatchTicks);
                 SessionState.EraseString(SessionKeyPlatform);
+                SessionState.EraseBool(SessionKeyPreflight);
                 if (clearRetryCount)
                 {
                     SessionState.EraseInt(SessionKeyRetryCount);
@@ -207,10 +248,37 @@ namespace PerSpec.Editor.Coordination
                     return;
                 }
 
+                // 0. The reload landed while the filter was still being resolved, so no run
+                //    was ever started. Hunting for a results file is guaranteed to find
+                //    nothing, and the PlayMode hand-off below would burn its whole delay
+                //    waiting on a completion checker that has no run to check. Re-queue.
+                if (SessionState.GetBool(SessionKeyPreflight, false))
+                {
+                    SessionState.EraseBool(SessionKeyPreflight);
+
+                    int preflightRetries = SessionState.GetInt(SessionKeyRetryCount, 0);
+                    if (preflightRetries < MaxReloadRetries)
+                    {
+                        SessionState.SetInt(SessionKeyRetryCount, preflightRetries + 1);
+                        retryScheduled = true;
+
+                        _dbManager.UpdateRequestStatus(request.Id, "pending",
+                            "Re-queued: domain reload landed while resolving the filter, before any test ran");
+                        _dbManager.LogExecution(request.Id, "WARN", "Unity",
+                            "Domain reload during filter resolution - re-queued");
+
+                        Debug.LogWarning($"[TestCoordinator] Re-queued request #{requestId} - reload " +
+                                         "interrupted filter resolution before the run started");
+                        return;
+                    }
+
+                    // Already retried once: fall through to the failure rung below.
+                }
+
                 Debug.LogWarning($"[TestCoordinator] Request #{requestId} was interrupted by a domain reload " +
                                  $"(status: {request.Status}) - attempting recovery");
 
-                DateTime dispatchTime = ResolveDispatchTime(request);
+                DateTime dispatchTime = ResolveRunAnchor(request);
 
                 // 1. Did Unity actually finish and write results before the reload?
                 string resultFile = FindResultFileNewerThan(dispatchTime.AddSeconds(-5), request);
@@ -368,27 +436,43 @@ namespace PerSpec.Editor.Coordination
         /// "I do not know when this ran" has to mean "adopt nothing", not "adopt anything from
         /// the last five minutes", which is what the old fallback meant.
         /// </summary>
-        private static DateTime ResolveDispatchTime(TestRequest request)
+        private static DateTime ResolveRunAnchor(TestRequest request)
         {
-            string raw = SessionState.GetString(SessionKeyDispatchTicks, string.Empty);
-            if (!string.IsNullOrEmpty(raw) && long.TryParse(raw, out long ticks))
+            if (request == null)
             {
-                try
+                return DateTime.MaxValue;
+            }
+
+            // The SessionState stamp describes whichever request is currently marked
+            // in-flight, so it is only valid for THAT request. Reading it for any other id
+            // yields a different run's clock - harmless for the single original caller,
+            // wrong the moment a sweep over many rows reuses this.
+            if (SessionState.GetInt(SessionKeyActiveRequestId, -1) == request.Id)
+            {
+                string raw = SessionState.GetString(SessionKeyDispatchTicks, string.Empty);
+                if (!string.IsNullOrEmpty(raw) && long.TryParse(raw, out long ticks))
                 {
-                    return new DateTime(ticks);
-                }
-                catch (ArgumentOutOfRangeException)
-                {
-                    // Corrupt value - fall through.
+                    try
+                    {
+                        return new DateTime(ticks);
+                    }
+                    catch (ArgumentOutOfRangeException)
+                    {
+                        // Corrupt value - fall through.
+                    }
                 }
             }
 
-            if (request != null && request.StartedAt.HasValue && request.StartedAt.Value != default)
+            // StartedAt is stamped on the 'processing' write and never re-stamped, so it is
+            // the only column that means "dispatched". CreatedAt is when Python inserted the
+            // row and can be arbitrarily older when the request queued behind a compile or
+            // another run - the single largest source of false timeouts.
+            if (request.StartedAt.HasValue && request.StartedAt.Value != default)
             {
                 return request.StartedAt.Value;
             }
 
-            if (request != null && request.CreatedAt != default)
+            if (request.CreatedAt != default)
             {
                 return request.CreatedAt;
             }
@@ -403,6 +487,22 @@ namespace PerSpec.Editor.Coordination
         /// </summary>
         private static string FindResultFileNewerThan(DateTime cutoff, TestRequest request)
         {
+            return FindResultFileNewerThan(cutoff, request, out _, out _);
+        }
+
+        /// <summary>
+        /// As above, but reports what it saw. A caller that is about to write a fallback
+        /// verdict needs to distinguish "no results file existed at all" from "files existed
+        /// but demonstrably belonged to another run" - those are very different failures and
+        /// must not collapse into the same status.
+        /// </summary>
+        private static string FindResultFileNewerThan(DateTime cutoff, TestRequest request,
+                                                      out TestResultVerification verification,
+                                                      out bool sawAnyCandidate)
+        {
+            verification = default;
+            sawAnyCandidate = false;
+
             try
             {
                 string projectPath = Directory.GetParent(Application.dataPath).FullName;
@@ -427,9 +527,11 @@ namespace PerSpec.Editor.Coordination
                     candidates.Add(appDataResult);
                 }
 
+                sawAnyCandidate = candidates.Count > 0;
+
                 // Recovery is the end of the line for this run, so a broader run's file is
                 // better than nothing - it contributes only its matching subset.
-                string chosen = TestResultVerifier.PickBest(candidates, request, true, out var verification);
+                string chosen = TestResultVerifier.PickBest(candidates, request, true, out verification);
 
                 if (chosen == null && candidates.Count > 0)
                 {
@@ -487,55 +589,90 @@ namespace PerSpec.Editor.Coordination
                              $"(type: {request.RequestType}, platform: {request.TestPlatform}, status: {request.Status}, " +
                              $"CreatedAt={request.CreatedAt:O}, age={TimeSpan.FromTicks(ageTicks).TotalSeconds:F1}s)");
 
-                    // Check if test results exist in AppData (Unity's default output location)
-                    string appDataResult = FindAppDataTestResult();
-                    TestResultVerification verification = default;
-                    bool sawResultsFile = false;
-
-                    if (!string.IsNullOrEmpty(appDataResult) && File.Exists(appDataResult))
-                    {
-                        // Check if the result file was written after the request was created
-                        var resultFileTime = File.GetLastWriteTime(appDataResult);
-                        if (resultFileTime > request.CreatedAt)
-                        {
-                            sawResultsFile = true;
-                            Debug.Log($"[TestCoordinator] Found potential results at {appDataResult} " +
-                                     $"(written: {resultFileTime:HH:mm:ss}, request created: {request.CreatedAt:HH:mm:ss})");
-
-                            // Try to recover using the result file
-                            if (TryRecoverFromResultFile(request, appDataResult, out verification))
-                            {
-                                Debug.Log($"[TestCoordinator] Successfully recovered request #{request.Id} from AppData results");
-                                continue;
-                            }
-                        }
-                    }
-
-                    // Distinguish the two very different reasons we got here. 'failed' means the
-                    // run left no trace at all; 'inconclusive' means results existed but were not
-                    // this request's - and the latter must never be silently reported as a pass.
-                    if (sawResultsFile && verification.IsDefinitiveMiss)
-                    {
-                        _dbManager.UpdateRequestStatus(request.Id, "inconclusive", verification.Reason);
-                        _dbManager.LogExecution(request.Id, "WARN", "Unity", verification.Reason);
-
-                        Debug.LogWarning($"[TestCoordinator] Marked stuck request #{request.Id} as inconclusive: {verification.Reason}");
-                    }
-                    else
-                    {
-                        _dbManager.UpdateRequestStatus(request.Id, "failed",
-                            "Request interrupted by domain reload - no results recovered");
-                        _dbManager.LogExecution(request.Id, "WARN", "Unity",
-                            "Request orphaned by domain reload, marked as failed");
-
-                        Debug.LogWarning($"[TestCoordinator] Marked stuck request #{request.Id} as failed (no results found)");
-                    }
+                    FinalizeStuckRequest(
+                        request,
+                        ResolveRunAnchor(request),
+                        fallbackStatus: "failed",
+                        fallbackMessage: "Request interrupted by domain reload - no results recovered",
+                        source: "OrphanRecovery");
                 }
             }
             catch (Exception ex)
             {
                 Debug.LogWarning($"[TestCoordinator] Error recovering orphaned requests: {ex.Message}");
             }
+        }
+
+        /// <summary>
+        /// Drives one non-terminal request to a terminal status: adopt real results if any
+        /// exist, otherwise 'inconclusive' when results existed but demonstrably were not
+        /// this request's, otherwise the caller's fallback verdict. A request is never left
+        /// non-terminal.
+        ///
+        /// Shared by startup orphan recovery ('failed' - the editor restarted and the run is
+        /// gone) and the periodic watchdog ('timeout' - the run may still be alive but has
+        /// blown its ceiling). One decision ladder, two policies.
+        ///
+        /// Returns true when the row is confirmed terminal afterwards. A swallowed write -
+        /// SQLiteManager logs and returns on a locked database - must be retried by the
+        /// caller, not mistaken for success.
+        /// </summary>
+        private static bool FinalizeStuckRequest(TestRequest request, DateTime anchor,
+                                                 string fallbackStatus, string fallbackMessage,
+                                                 string source)
+        {
+            // 1. Recover first, always. A PlayMode run whose completion checker never fired
+            //    may have written a perfectly good XML that simply nobody adopted.
+            string resultFile = FindResultFileNewerThan(anchor.AddSeconds(-5), request,
+                                                        out var verification,
+                                                        out bool sawResultsFile);
+
+            if (!string.IsNullOrEmpty(resultFile) &&
+                TryRecoverFromResultFile(request, resultFile, out verification))
+            {
+                Debug.Log($"[TestCoordinator-{source}] Recovered request #{request.Id} from " +
+                          $"{Path.GetFileName(resultFile)} instead of marking it '{fallbackStatus}'");
+                return true;
+            }
+
+            // 2. Results existed but were provably not this request's. Never report that as
+            //    green, and never conflate it with "the run vanished". Of the two shapes,
+            //    'no_match' is the one the caller can fix by correcting the name; 'inconclusive'
+            //    means nothing ran at all, which a broken run explains just as well.
+            if (sawResultsFile && verification.IsDefinitiveMiss)
+            {
+                string missStatus = verification.MissStatus;
+
+                _dbManager.UpdateRequestStatus(request.Id, missStatus, verification.Reason);
+                _dbManager.LogExecution(request.Id, "WARN", "Unity", $"{source}: {verification.Reason}");
+
+                Debug.LogWarning($"[TestCoordinator-{source}] Marked request #{request.Id} " +
+                                 $"{missStatus}: {verification.Reason}");
+                return true;
+            }
+
+            // 3. Nothing usable - the caller's verdict.
+            string message = fallbackMessage;
+            if (sawResultsFile && !string.IsNullOrEmpty(verification.Reason))
+            {
+                message += $" Result files were seen but rejected: {verification.Reason}";
+            }
+
+            float elapsed = anchor == DateTime.MaxValue
+                ? 0f
+                : (float)Math.Max(0.0, (DateTime.Now - anchor).TotalSeconds);
+
+            // UpdateRequestResults rather than UpdateRequestStatus: it stamps CompletedAt,
+            // records the elapsed time, and zeroes the counts so nothing downstream can read
+            // stale numbers off a row that produced no results.
+            _dbManager.UpdateRequestResults(request.Id, fallbackStatus, 0, 0, 0, 0, elapsed, message);
+            _dbManager.LogExecution(request.Id, "ERROR", "Unity", $"{source}: {message}");
+
+            Debug.LogWarning($"[TestCoordinator-{source}] Marked request #{request.Id} " +
+                             $"as '{fallbackStatus}': {message}");
+
+            string after = _dbManager.GetRequestStatus(request.Id);
+            return after != null && TerminalStatuses.Contains(after);
         }
 
         /// <summary>
@@ -727,6 +864,204 @@ namespace PerSpec.Editor.Coordination
             }
         }
         
+        #region Stuck-Run Watchdog
+
+        /// <summary>
+        /// Backstop that guarantees no request stays non-terminal forever. Self-throttling
+        /// and idempotent, so it is safe to call from any tick source: the editor update
+        /// loop (main thread, throttled when the editor is unfocused) and BackgroundPoller's
+        /// threading timer (fires unfocused, marshals here) both drive it.
+        /// </summary>
+        internal static void TickWatchdog()
+        {
+            if (_dbManager == null || !_dbManager.IsInitialized) return;
+            if (!EditorPrefs.GetBool(PrefWatchdogEnabled, true)) return;
+
+            double now = EditorApplication.timeSinceStartup;
+            if (now - _lastWatchdogSweepTime < WatchdogSweepIntervalSeconds) return;
+            _lastWatchdogSweepTime = now;
+
+            // A reload is imminent. RecoverInterruptedTestRequest owns that case and runs on
+            // the other side with strictly better information than this sweep has.
+            if (EditorApplication.isCompiling || EditorApplication.isUpdating) return;
+
+            RunWatchdogSweep();
+        }
+
+        private static void RunWatchdogSweep()
+        {
+            try
+            {
+                // Query with the smallest ceiling any request can have, then apply the exact
+                // per-request ceiling in C#. Same reasoning as RecoverOrphanedRequests'
+                // safety gate: sqlite-net's CreatedAt comparison against TEXT timestamps is
+                // not trustworthy on its own, so the SQL filter is a pre-filter and never the
+                // decision.
+                var candidates = _dbManager.GetStuckRequests(TimeSpan.FromSeconds(WatchdogFloorSeconds));
+                if (candidates.Count == 0) return;
+
+                foreach (var request in candidates)
+                {
+                    if (_watchdogHandled.Contains(request.Id)) continue;
+
+                    DateTime anchor = ResolveRunAnchor(request);
+                    if (anchor == DateTime.MaxValue) continue;   // unknown start - never guess
+
+                    double elapsed = (DateTime.Now - anchor).TotalSeconds;
+                    double ceiling = ResolveWatchdogCeiling(request);
+                    if (elapsed < ceiling) continue;
+
+                    // Re-read immediately before acting: PlayModeTestCompletionChecker's
+                    // FinalizeRequest or a Python-side cancel may have finished this row
+                    // since GetStuckRequests ran.
+                    string liveStatus = _dbManager.GetRequestStatus(request.Id);
+                    if (liveStatus == null || TerminalStatuses.Contains(liveStatus)) continue;
+                    request.Status = liveStatus;
+
+                    bool owned = IsOwnedByThisSession(request.Id);
+                    bool inPlayMode = EditorApplication.isPlaying;
+
+                    Debug.LogWarning(
+                        $"[TestCoordinator-Watchdog] Request #{request.Id} has been '{liveStatus}' " +
+                        $"for {elapsed:F0}s (ceiling {ceiling:F0}s, platform {request.TestPlatform}, " +
+                        $"type {request.RequestType}, isPlaying={inPlayMode}, " +
+                        $"ownedByThisSession={owned}) - finalizing");
+
+                    string why = inPlayMode
+                        ? "Unity was still in PlayMode - the run never returned to EditMode, " +
+                          "so PlayModeTestCompletionChecker never ran."
+                        : "No in-process test monitor was alive to time this run out.";
+
+                    bool finalized = FinalizeStuckRequest(
+                        request,
+                        anchor,
+                        fallbackStatus: "timeout",
+                        fallbackMessage:
+                            $"Watchdog: no result was published within {ceiling:F0}s of dispatch " +
+                            $"(elapsed {elapsed:F0}s, status '{liveStatus}', platform " +
+                            $"{request.TestPlatform}). {why}",
+                        source: "Watchdog");
+
+                    if (!finalized)
+                    {
+                        // The write did not land - a locked database logs and returns. Leave
+                        // the id unhandled so the next sweep retries it rather than
+                        // abandoning the row for the rest of the session.
+                        continue;
+                    }
+
+                    _watchdogHandled.Add(request.Id);
+
+                    // Order matters: the play-mode decision reads the in-flight marker that
+                    // ReleaseLocalRunIfOwned is about to erase.
+                    MaybeStopPlayModeFor(request, owned);
+                    ReleaseLocalRunIfOwned(request.Id);
+                }
+            }
+            catch (Exception ex)
+            {
+                Debug.LogWarning($"[TestCoordinator-Watchdog] Sweep failed: {ex.Message}");
+            }
+        }
+
+        /// <summary>
+        /// Stays strictly above TestExecutor's own ceilings so a live in-process monitor
+        /// always gets to write the more precise result first (a synthesised XML for method
+        /// runs, the rejection breadcrumb, the OnTestComplete handoff).
+        /// 300 -> 600 for batch runs, 600 -> 900 for single methods.
+        ///
+        /// Deliberately above Python's default --timeout 300 as well: --wait giving up is a
+        /// client-side decision and does not mean the run is dead.
+        /// </summary>
+        private static double ResolveWatchdogCeiling(TestRequest request)
+        {
+            int overrideSeconds = EditorPrefs.GetInt(PrefWatchdogTimeoutSeconds, 0);
+            if (overrideSeconds > 0)
+            {
+                return Math.Max(WatchdogFloorSeconds, overrideSeconds);
+            }
+
+            double executorCeiling = request.RequestType == "method"
+                ? TestExecutor.MAX_WAIT_TIME_INDIVIDUAL
+                : TestExecutor.MAX_WAIT_TIME;
+
+            return executorCeiling + WatchdogGraceSeconds;
+        }
+
+        private static bool IsOwnedByThisSession(int requestId)
+        {
+            return (_isRunningTests && _currentRequestId == requestId) ||
+                   SessionState.GetInt(SessionKeyActiveRequestId, -1) == requestId;
+        }
+
+        /// <summary>
+        /// If this editor session still believes it is running the request the watchdog just
+        /// terminated, tear the local run down. Without this _isRunningTests latches on and
+        /// TryDispatchNextRequest's first guard refuses every later request for the rest of
+        /// the session - the run is dead AND nothing new can start.
+        ///
+        /// A request owned by nobody here belongs to a previous session (an editor restart)
+        /// or to another editor instance. There is no owner column to check, so the database
+        /// write is all we do: aborting a run this session does not own would be guesswork.
+        /// </summary>
+        private static void ReleaseLocalRunIfOwned(int requestId)
+        {
+            if (_isRunningTests && _currentRequestId == requestId)
+            {
+                // Mirrors CancelCurrentTest. Without Abort the file monitor and the
+                // TestRunnerApi callbacks leak into the next run and compete for its files.
+                _testExecutor?.Abort();
+                _isRunningTests = false;
+                _currentRequestId = -1;
+            }
+
+            if (SessionState.GetInt(SessionKeyActiveRequestId, -1) == requestId)
+            {
+                ForgetInFlightRequest();
+            }
+        }
+
+        /// <summary>
+        /// Opt-in only. Stopping play mode is a visible, irreversible side effect on a
+        /// session the user may be driving by hand, and it buys the database nothing - the
+        /// row is already terminal by the time this runs. The dangerous shape is real: a
+        /// stale 'processing' row plus a user who pressed Play for unrelated debugging.
+        /// Useful for unattended or CI editors, hence the pref.
+        /// </summary>
+        private static void MaybeStopPlayModeFor(TestRequest request, bool ownedByThisSession)
+        {
+            if (!EditorApplication.isPlaying) return;
+            if (!ownedByThisSession) return;   // never stop a session we did not start
+            if (!EditorPrefs.GetBool(PrefWatchdogStopPlayMode, false)) return;
+
+            Debug.LogWarning($"[TestCoordinator-Watchdog] Stopping PlayMode - request " +
+                             $"#{request.Id} timed out and {PrefWatchdogStopPlayMode} is enabled");
+            EditorApplication.isPlaying = false;
+        }
+
+        /// <summary>
+        /// Runs the sweep now, ignoring the interval and the already-handled set.
+        /// Exposed for the Control Center.
+        /// </summary>
+        public static void ForceWatchdogSweep()
+        {
+            _watchdogHandled.Clear();
+            RunWatchdogSweep();
+            Debug.Log("[TestCoordinator-Watchdog] Manual sweep complete");
+        }
+
+        // Test facades. The watchdog's two pure decisions - how long a run is allowed and
+        // when it is considered to have started - are where a false timeout would come
+        // from, so they are the parts worth pinning down in tests. Facades rather than
+        // reflection, per the project's testing rules.
+        public static double Test_ResolveWatchdogCeiling(TestRequest request)
+            => ResolveWatchdogCeiling(request);
+
+        public static DateTime Test_ResolveRunAnchor(TestRequest request)
+            => ResolveRunAnchor(request);
+
+        #endregion
+
         private static void OnEditorUpdate()
         {
             // Check for new requests periodically using Editor time
@@ -741,6 +1076,12 @@ namespace PerSpec.Editor.Coordination
                 // Update heartbeat every check
                 _dbManager.UpdateSystemHeartbeat("Unity");
             }
+
+            // Outside the dispatch gate on purpose. It carries its own 30s accumulator (a
+            // stuck-request query is far too expensive at the 1s dispatch rate), and
+            // TogglePolling sets _checkInterval to 0 - which must not take the watchdog with
+            // it, nor run it every frame.
+            TickWatchdog();
         }
 
         /// <summary>
@@ -784,7 +1125,7 @@ namespace PerSpec.Editor.Coordination
             }
         }
 
-        internal static void ProcessTestRequest(TestRequest request)
+        public static void ProcessTestRequest(TestRequest request)
         {
             // Re-assert the guards: this is public-ish surface reachable from the Control
             // Center and BackgroundPoller, not just from TryDispatchNextRequest.
@@ -816,6 +1157,10 @@ namespace PerSpec.Editor.Coordination
                 return;
             }
 
+            // Claim the slot BEFORE the asynchronous pre-flight below. Both the editor-update
+            // poll and BackgroundPoller funnel into TryDispatchNextRequest, which gates on
+            // _isRunningTests alone - an unguarded pre-flight window would dispatch the same
+            // row twice.
             _isRunningTests = true;
             _currentRequestId = request.Id;
 
@@ -833,11 +1178,14 @@ namespace PerSpec.Editor.Coordination
 
                 // Persist the in-flight marker so a domain reload mid-run can be reconciled.
                 RememberInFlightRequest(request);
+                SessionState.SetBool(SessionKeyPreflight, true);
 
-                // Execute tests
-                _testExecutor.ExecuteTests(request, filter, OnTestComplete);
-
-                Debug.Log($"[TestCoordinator] Executing tests for request {request.Id}");
+                // Resolve the filter against the real test tree before anything runs. A filter
+                // that selects nothing is a caller mistake and is fully detectable here;
+                // entering PlayMode to discover it costs a full cycle and lands on a status
+                // that cannot be told apart from a compile failure.
+                TestFilterPreflight.Resolve(request, filter.testMode,
+                    outcome => OnPreflightResolved(request, filter, outcome));
             }
             catch (Exception ex)
             {
@@ -850,6 +1198,84 @@ namespace PerSpec.Editor.Coordination
                 _isRunningTests = false;
                 _currentRequestId = -1;
             }
+        }
+
+        /// <summary>
+        /// Second half of <see cref="ProcessTestRequest"/>, resumed once the filter has been
+        /// resolved against Unity's test tree.
+        /// </summary>
+        private static void OnPreflightResolved(TestRequest request, Filter filter, PreflightResult outcome)
+        {
+            // The world may have moved while the pre-flight was in flight: the user cancelled,
+            // or a domain reload reset the statics and handed the row to
+            // RecoverInterruptedTestRequest. Either way this result is stale, and somebody else
+            // owns the statics now - do NOT clear them here.
+            if (!_isRunningTests || _currentRequestId != request.Id)
+            {
+                Debug.Log($"[TestCoordinator] Discarding stale pre-flight result for request {request.Id}");
+                return;
+            }
+
+            SessionState.EraseBool(SessionKeyPreflight);
+
+            if (outcome.Verdict == PreflightVerdict.NoMatch)
+            {
+                WriteNoMatch(request, outcome);
+
+                ForgetInFlightRequest();
+                _isRunningTests = false;
+                _currentRequestId = -1;
+                return;
+            }
+
+            try
+            {
+                // Matched, or could not be verified. An unverifiable pre-flight must never
+                // block a run - proceeding is exactly what shipped before this check existed.
+                _testExecutor.ExecuteTests(request, filter, OnTestComplete);
+
+                Debug.Log($"[TestCoordinator] Executing tests for request {request.Id} ({outcome.Reason})");
+            }
+            catch (Exception ex)
+            {
+                Debug.LogError($"[TestCoordinator] Error processing request {request.Id}: {ex.Message}");
+
+                _dbManager.UpdateRequestStatus(request.Id, "failed", ex.Message);
+                _dbManager.LogExecution(request.Id, "ERROR", "Unity", $"Failed to execute tests: {ex.Message}");
+
+                ForgetInFlightRequest();
+                _isRunningTests = false;
+                _currentRequestId = -1;
+            }
+        }
+
+        /// <summary>
+        /// Records a request whose filter selected nothing. No test ran, so the row gets zero
+        /// counts and a message naming the filter.
+        /// </summary>
+        private static void WriteNoMatch(TestRequest request, PreflightResult outcome)
+        {
+            string message = outcome.ErrorMessage;
+
+            // UpdateRequestResults rather than UpdateRequestStatus: it also writes the zero
+            // counts and stamps completion. A 'no_match' row still carrying a previous
+            // total_tests would reintroduce exactly the ambiguity this status removes.
+            _dbManager.UpdateRequestResults(request.Id, "no_match", 0, 0, 0, 0, 0f, message);
+
+            // A database whose CHECK constraint predates 'no_match' rejects that write, and
+            // SQLiteManager swallows the failure - which would strand the row mid-flight,
+            // strictly worse than the old behaviour. Verify, and fall back if it did not take.
+            var stored = _dbManager.GetRequestById(request.Id);
+            if (stored != null && stored.Status != "no_match")
+            {
+                Debug.LogWarning("[TestCoordinator] The database rejected status 'no_match' - run " +
+                                 "PerSpec/Coordination/Scripts/db_update_status_constraint.py to update it. " +
+                                 "Falling back to 'inconclusive'.");
+                _dbManager.UpdateRequestResults(request.Id, "inconclusive", 0, 0, 0, 0, 0f, message);
+            }
+
+            _dbManager.LogExecution(request.Id, "ERROR", "Unity", message);
+            Debug.LogError($"[TestCoordinator] Request {request.Id}: {message}");
         }
         
         private static Filter CreateTestFilter(TestRequest request)
