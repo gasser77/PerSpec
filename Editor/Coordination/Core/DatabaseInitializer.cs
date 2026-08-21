@@ -372,7 +372,7 @@ namespace PerSpec.Editor.Coordination
         /// <summary>
         /// Self-healing migration for the test_requests status CHECK constraint.
         /// Databases created by an older Python db_initializer carry a constraint that
-        /// predates 'finalizing', 'timeout' and 'inconclusive'. Writing one of those
+        /// predates 'finalizing', 'timeout', 'inconclusive' and 'no_match'. Writing one of those
         /// statuses then throws "CHECK constraint failed", the error is swallowed, and the
         /// request keeps its previous status - which is one way a run appears stuck.
         /// SQLite cannot ALTER a CHECK constraint, so rebuild the table.
@@ -391,7 +391,7 @@ namespace PerSpec.Editor.Coordination
             // Already permits the full status set.
             string[] required = { "'pending'", "'processing'", "'executing'", "'finalizing'",
                                   "'running'", "'completed'", "'failed'", "'timeout'",
-                                  "'cancelled'", "'inconclusive'" };
+                                  "'cancelled'", "'inconclusive'", "'no_match'" };
             if (required.All(status => tableSql.Contains(status))) return;
 
             connection.RunInTransaction(() =>
@@ -406,7 +406,7 @@ namespace PerSpec.Editor.Coordination
                         status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN (
                             'pending', 'processing', 'executing', 'finalizing',
                             'running', 'completed', 'failed', 'timeout',
-                            'cancelled', 'inconclusive'
+                            'cancelled', 'inconclusive', 'no_match'
                         )),
                         priority INTEGER DEFAULT 0,
                         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -439,7 +439,7 @@ namespace PerSpec.Editor.Coordination
                 connection.Execute("CREATE INDEX IF NOT EXISTS idx_test_requests_created ON test_requests(created_at DESC)");
             });
 
-            Debug.Log("[DatabaseInitializer] Upgraded test_requests status constraint (added finalizing/timeout/inconclusive)");
+            Debug.Log("[DatabaseInitializer] Upgraded test_requests status constraint (added finalizing/timeout/inconclusive/no_match)");
         }
 
         private static void InitializeSystemStatus(SQLiteConnection connection)

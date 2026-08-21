@@ -433,6 +433,87 @@ def apply_migration_v6(conn):
         return False
 
 
+def apply_migration_v7(conn):
+    """Migration v7: Add 'no_match' to test_requests status CHECK constraint.
+
+    'no_match' is the terminal status for a request whose filter resolved to zero
+    tests - a caller mistake, detected before any test runs. It used to be folded
+    into 'inconclusive' alongside "tests ran but all skipped" and "compilation
+    errors blocked the run", which made a typo indistinguishable from a condition
+    of the project. Without this constraint value the write is rejected, the error
+    is swallowed, and the row is stranded mid-flight.
+    """
+    print("  Applying Migration v7: Add 'no_match' status value...")
+    cursor = conn.cursor()
+
+    try:
+        cursor.execute("""
+            SELECT sql FROM sqlite_master
+            WHERE type='table' AND name='test_requests'
+        """)
+        result = cursor.fetchone()
+        if not result or not result[0]:
+            print("    test_requests table missing - skipping")
+            return True
+
+        if "'no_match'" in result[0]:
+            print("    'no_match' already present - skipping")
+            return True
+
+        print("    Rebuilding test_requests to add 'no_match'...")
+
+        cursor.execute("DROP TABLE IF EXISTS test_requests_new")
+        cursor.execute("""
+            CREATE TABLE test_requests_new (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                request_type TEXT NOT NULL,
+                test_filter TEXT,
+                test_platform TEXT NOT NULL,
+                priority INTEGER DEFAULT 0,
+                status TEXT DEFAULT 'pending' CHECK(status IN (
+                    'pending', 'processing', 'executing', 'finalizing',
+                    'running', 'completed', 'failed', 'timeout',
+                    'cancelled', 'inconclusive', 'no_match'
+                )),
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                started_at TIMESTAMP,
+                completed_at TIMESTAMP,
+                total_tests INTEGER,
+                passed_tests INTEGER,
+                failed_tests INTEGER,
+                skipped_tests INTEGER,
+                duration_seconds REAL,
+                error_message TEXT
+            )
+        """)
+
+        cursor.execute("""
+            INSERT INTO test_requests_new (
+                id, request_type, test_filter, test_platform, priority,
+                status, created_at, started_at, completed_at,
+                total_tests, passed_tests, failed_tests, skipped_tests,
+                duration_seconds, error_message
+            )
+            SELECT
+                id, request_type, test_filter, test_platform, priority,
+                status, created_at, started_at, completed_at,
+                total_tests, passed_tests, failed_tests, skipped_tests,
+                duration_seconds, error_message
+            FROM test_requests
+        """)
+
+        cursor.execute("DROP TABLE test_requests")
+        cursor.execute("ALTER TABLE test_requests_new RENAME TO test_requests")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_test_requests_status ON test_requests(status)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_test_requests_created ON test_requests(created_at)")
+
+        print("    'no_match' added to status constraint")
+        return True
+    except Exception as e:
+        print(f"    Error in migration v7: {e}")
+        return False
+
+
 def run_maintenance():
     """Run all database maintenance tasks"""
     print("\n" + "="*60)
@@ -465,6 +546,7 @@ def run_maintenance():
             (4, "Add performance indexes", apply_migration_v4),
             (5, "Add 'inconclusive' status value", apply_migration_v5),
             (6, "Add 'compiling' refresh status value", apply_migration_v6),
+            (7, "Add 'no_match' status value", apply_migration_v7),
         ]
         
         # Apply pending migrations

@@ -87,8 +87,10 @@ class DatabaseCleaner:
             cursor.execute("DELETE FROM test_results WHERE created_at < ?", (cutoff_str,))
             deleted_results = cursor.rowcount
             
-            cursor.execute("DELETE FROM test_requests WHERE created_at < ? AND status IN ('completed', 'failed', 'cancelled')", 
-                         (cutoff_str,))
+            # Must list EVERY terminal status: one left out is a row that is never cleaned.
+            cursor.execute("DELETE FROM test_requests WHERE created_at < ? AND status IN "
+                           "('completed', 'failed', 'cancelled', 'timeout', 'inconclusive', 'no_match')",
+                           (cutoff_str,))
             deleted_requests = cursor.rowcount
             
             # Clean execution logs

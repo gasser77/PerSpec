@@ -52,7 +52,7 @@ def create_database():
                 status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN (
                     'pending', 'processing', 'executing', 'finalizing',
                     'running', 'completed', 'failed', 'timeout',
-                    'cancelled', 'inconclusive'
+                    'cancelled', 'inconclusive', 'no_match'
                 )),
                 priority INTEGER DEFAULT 0,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,

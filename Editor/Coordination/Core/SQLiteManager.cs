@@ -371,7 +371,7 @@ namespace PerSpec.Editor.Coordination
                         }
                     }
                 }
-                else if (status == "completed" || status == "failed" || status == "cancelled")
+                else if (CompletionStatuses.Contains(status))
                 {
                     var completedProp = entity.GetType().GetProperty("CompletedAt");
                     if (completedProp != null)
@@ -392,6 +392,21 @@ namespace PerSpec.Editor.Coordination
             }
         }
         
+        /// <summary>
+        /// Statuses that end a request. 'timeout' and 'inconclusive' used to be missing
+        /// from the CompletedAt branch above, so UpdateRequestStatus(id, "inconclusive", ...)
+        /// - which RecoverOrphanedRequests really does call - wrote a terminal status with
+        /// a NULL completed_at, and every reader keyed off that column saw a finished
+        /// request as still running.
+        ///
+        /// Safe to widen: the only other writers of those two statuses go through
+        /// UpdateRequestResults, which stamps CompletedAt unconditionally.
+        /// </summary>
+        private static readonly HashSet<string> CompletionStatuses = new HashSet<string>
+        {
+            "completed", "failed", "cancelled", "timeout", "inconclusive", "no_match"
+        };
+
         public string GetRequestStatus(int requestId)
         {
             if (!_isInitialized) return null;
@@ -1103,7 +1118,8 @@ namespace PerSpec.Editor.Coordination
                 int deletedResults = _connection.Execute("DELETE FROM test_results WHERE created_at < ?", cutoffTime);
                 
                 // Delete old test requests
-                int deletedRequests = _connection.Execute("DELETE FROM test_requests WHERE created_at < ? AND status IN ('completed', 'failed', 'cancelled', 'inconclusive')", cutoffTime);
+                // Must list EVERY terminal status: one left out is a row that is never cleaned.
+                int deletedRequests = _connection.Execute("DELETE FROM test_requests WHERE created_at < ? AND status IN ('completed', 'failed', 'cancelled', 'timeout', 'inconclusive', 'no_match')", cutoffTime);
                 
                 if (deletedResults > 0 || deletedRequests > 0)
                 {
