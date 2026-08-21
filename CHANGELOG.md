@@ -5,6 +5,155 @@ All notable changes to the PerSpec Testing Framework will be documented in this 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.12.0] - 2026-08-21
+
+### Added
+- **`no_match`: a filter that matches nothing is now its own terminal status**
+  - `inconclusive` used to mean three unrelated things at once: tests ran and were all
+    skipped, compilation errors blocked the run, and *the filter named something that does
+    not exist*. Only the third is a caller mistake, and collapsing it with the other two hid
+    the one thing the caller could actually fix. The reported symptom was a wrong namespace
+    submitted three times in a row, because "inconclusive" reads as "flaky, run it again".
+  - A request whose filter resolves to zero tests now ends as `no_match`, with an
+    `error_message` naming the filter. `inconclusive` keeps its honest meaning: the run
+    produced no usable evidence either way.
+- **The filter is resolved BEFORE PlayMode is entered**
+  - New `TestFilterPreflight` walks Unity's test tree via `TestRunnerApi.RetrieveTestList`
+    and answers "does this filter select anything?" without starting a run. The reported case
+    now fails in about a second and never enters PlayMode, instead of costing a full cycle.
+  - Covers `class`, `method` **and** `category`. Categories can be judged properly here for
+    the first time: per-test categories exist in the test tree but not in the NUnit results
+    XML, so the after-the-fact verifier could only ever report them as unverifiable.
+  - Governing rule: a pre-flight that cannot answer returns "could not verify" and lets the
+    run proceed. An empty test tree, a null callback, a 30s watchdog expiry, a malformed
+    category regex, or an explicitly parenthesised filter all fall back to exactly the
+    behaviour that shipped before. A false `no_match` would send a caller to rename a class
+    that was fine - the same failure inverted - so uncertainty never blocks a run.
+- **Near-miss suggestions now catch a wrong namespace, not just a missing one**
+  - `TestResultVerifier.SuggestQualifiedName` gained a second pass matching on the last
+    segment, so `TestProj.Modules.Tests.WidgetAlignerTests` now suggests
+    `TestProj.Core.Tests.WidgetAlignerTests`. The old single pass only handled an
+    omitted prefix, so for the reported bug it produced no suggestion at all.
+  - `+` counts as a segment boundary, so a dotted nested-class filter is answered with the
+    real `Outer+Inner` spelling.
+- **Exit code 6 from `quick_test.py`** for `no_match`, so a caller can tell "you typed the
+  name wrong" apart from "the tests are red" (1) and stop retrying.
+
+### Changed
+- **The after-the-run zero-match paths report `no_match` too**
+  - `TestExecutor.DescribeFilterMismatch`, `PlayModeTestCompletionChecker`, orphan recovery,
+    and the Python `print_summary` downgrade now all distinguish "tests ran and not one was
+    this filter's" (`no_match`) from "nothing ran at all" (`inconclusive`). One status means
+    one thing wherever it is written.
+- **`no_match` never adopts a results file**
+  - No test ran, so no XML can belong to the request. The client no longer waits out the XML
+    grace period for one, and no longer prints a verification line about some other run's
+    file - the same "stale green" hazard that made the original typo take four attempts to
+    find.
+- **The Control Center's "Run Pending Tests" uses the real dispatcher**
+  - `TestCoordinationService` carried a parallel implementation with its own run-state flags
+    and its own filter builder that always used `testNames` - which a class name can never
+    match, so a class dispatched from the Control Center silently ran nothing. It also
+    skipped the `"Both"` platform rejection and could start a run while the coordinator
+    believed none was active. It now forwards to `TestCoordinatorEditor.ProcessTestRequest`.
+
+### Fixed
+- **Terminal rows that were never cleaned up**
+  - `SQLiteManager` and `quick_clean.py` deleted only `completed`/`failed`/`cancelled` rows,
+    so every `timeout` and `inconclusive` request accumulated forever. All terminal statuses
+    are now listed in both.
+- **`Cancelled test request -1`**
+  - The Control Center's cancel logged the request id after clearing it, so it always named
+    `-1`.
+
+### Upgrade notes
+- Existing databases migrate themselves: Unity self-heals the `status` CHECK constraint on
+  load (`DatabaseInitializer`), and `db_auto_maintenance.py` gained an idempotent migration
+  v7. To do it by hand, run
+  `python PerSpec/Coordination/Scripts/db_update_status_constraint.py`.
+- If a database still rejects `no_match`, both the C# and the Python writer detect the
+  rejected write and fall back to `inconclusive` rather than stranding the row mid-flight.
+
+## [1.11.0] - 2026-08-21
+
+### Added
+- **`test_results.py` now names the run it is showing**
+  - `latest` and `show` print a `Contains:` line - the number of test-cases and the
+    distinct classes they belong to - and `list` prints the same digest under every file.
+    Derived from the `<test-case fullname>` entries, which are the only ground truth about
+    whose run a file is. The root counts and the file mtime cannot tell one run's output
+    from another's.
+  - The `Timestamp:` line now says `(file mtime, not from the XML)`, which is what it has
+    always silently been.
+- **`test_results.py latest --for-request <id>`**
+  - Reads the request from the coordination database, derives the window in which its
+    results could possibly have been written (`started_at ?? created_at`, minus a 5s
+    clock-skew buffer - the same ladder the C# side uses), and refuses to print anything it
+    cannot attribute to that request.
+  - When the request never finished it exits **5** and prints nothing from any file. This is
+    the reported case: `--wait` timed out, the row was still `processing`, and `latest`
+    happily showed the previous class's green run.
+  - When the request finished but nothing on disk contains its tests, it exits **3** (or 1
+    for a non-`completed` row), naming the classes the candidate files actually hold and,
+    where it can, the fully qualified filter the caller probably meant.
+  - Prints the candidate ledger - every file considered and why it was rejected.
+  - Scores the **matched subset** rather than the file's totals, so `--allow-partial` cannot
+    report a broader run's failures as this request's.
+  - Under `--json`, `results` is `null` whenever the outcome is not `ok`, so a scripted
+    caller is physically unable to read another run's counts.
+- **`test_results.py latest --newer-than <when>`** - a relative age (`15m`, `2h`, `1d`),
+  epoch seconds, or ISO 8601. Exits non-zero when nothing has been written in that window.
+- **Stuck-run watchdog (`TestCoordinatorEditor.TickWatchdog`)**
+  - Guarantees no test request stays non-terminal indefinitely. Sweeps every 30s, driven
+    both from `EditorApplication.update` and from `BackgroundPoller`'s threading timer, so
+    it keeps ticking while the editor is unfocused.
+  - Recovers first and times out last: a run whose completion checker never fired may have
+    written a perfectly good XML that nobody adopted, so the same content-verified recovery
+    ladder runs before any `timeout` is written.
+  - Ceiling is `TestExecutor`'s own ceiling plus a 300s grace (600s batch, 900s single
+    method), deliberately above both the in-process monitor and Python's `--timeout`, so the
+    more precise in-process result always wins when one is possible.
+  - Prefs: `PerSpec_Watchdog_Enabled`, `PerSpec_Watchdog_TimeoutSeconds` (0 = auto),
+    `PerSpec_Watchdog_StopPlayMode` (off by default).
+
+### Fixed
+- **A PlayMode run that hung could stay `processing` forever**
+  - `TestExecutor`'s `MAX_WAIT_TIME` monitor lives on `EditorApplication.update` inside an
+    object the enter-PlayMode domain reload destroys, so `HandleTestTimeout` can never fire
+    for a PlayMode run. `PlayModeTestCompletionChecker` only acts on `EnteredEditMode`. And
+    `RecoverOrphanedRequests` ran **only from the `[InitializeOnLoad]` static constructor** -
+    that is, only on a domain reload, which a run wedged inside play mode never triggers.
+  - Between them, nothing was watching. The row stayed non-terminal, `--wait` gave up at its
+    client-side timeout, and orphan recovery never saw the request at all.
+- **A wedged run could disable testing for the rest of the editor session**
+  - `_isRunningTests` stayed `true` for the stuck request, and it is the first guard in
+    `TryDispatchNextRequest`, so every later request was silently refused. The watchdog now
+    tears the local run down - but only for a request this session actually owns.
+- **`timeout` and `inconclusive` rows had a NULL `completed_at`**
+  - `UpdateStatusBase` stamped `CompletedAt` only for `completed|failed|cancelled`, yet
+    `RecoverOrphanedRequests` really does call `UpdateRequestStatus(id, "inconclusive", ...)`.
+    Any reader keying off that column saw a finished request as still running.
+- **`test_results.py failed` listed every failure once per failure**
+  - `all_failed.extend(failed)` sat inside the loop that stamped each test, so a file with
+    four failures printed all four of them four times.
+- **`ResolveDispatchTime` read the SessionState dispatch stamp for any request**
+  - The stamp describes whichever request is currently marked in-flight. Harmless for its
+    one original caller, wrong the moment a sweep over many rows reuses it. Renamed
+    `ResolveRunAnchor` and now checks the marker names the request being asked about.
+
+### Changed
+- **`quick_test.py --wait` exits 5 on a timeout**, no longer 1, and says explicitly that NO
+  results were produced for the request, that it is still in status X, and that
+  `test_results.py latest` will therefore show an OLDER run. Points at
+  `latest --for-request <id>` and `stuck --repair`. Exit 1 no longer means "or timed out".
+- **Orphan recovery searches `PerSpec/TestResults` too, and anchors on `started_at`**
+  - It previously probed only Unity's AppData copy and measured age from `created_at`, which
+    is when Python inserted the row - arbitrarily earlier than dispatch when the request
+    queued behind a compile. It now shares one decision ladder with the watchdog
+    (`FinalizeStuckRequest`), differing only in its verdict: `failed` for "the editor
+    restarted and the run is gone", `timeout` for "it may still be alive but blew its
+    ceiling".
+
 ## [1.10.0] - 2026-08-21
 
 ### Added

@@ -53,6 +53,7 @@ python Packages/com.digitraver.perspec/ScriptingTools/sync_python_scripts.py
 | "export logs"       | `python PerSpec/Coordination/Scripts/monitor_editmode_logs.py sessions`                     |
 | "monitor logs live" | `python PerSpec/Coordination/Scripts/monitor_editmode_logs.py live`                         |
 | "test results"      | `python PerSpec/Coordination/Scripts/test_results.py latest`                                |
+| "did MY run pass"   | `python PerSpec/Coordination/Scripts/test_results.py latest --for-request <id>`             |
 | "show test results" | `python PerSpec/Coordination/Scripts/test_results.py latest -v`                             |
 | "failed tests"      | `python PerSpec/Coordination/Scripts/test_results.py failed`                                |
 | "open console"      | `python PerSpec/Coordination/Scripts/quick_menu.py execute "Window/General/Console" --wait` |
@@ -164,8 +165,15 @@ python PerSpec/Coordination/Scripts/test_playmode_logs.py -S "null" --errors  # 
 
 ### View Test Results
 ```bash
-# Show latest test results with summary
+# Show latest test results with summary (names the classes it contains)
 python PerSpec/Coordination/Scripts/test_results.py latest
+
+# Confirm a SPECIFIC request's results - refuses to show another run's, and exits
+# 5 when the request never finished, 3 when nothing on disk matches its filter
+python PerSpec/Coordination/Scripts/test_results.py latest --for-request 400
+
+# Only consider results written recently
+python PerSpec/Coordination/Scripts/test_results.py latest --newer-than 15m
 
 # Show latest with detailed output (all tests)
 python PerSpec/Coordination/Scripts/test_results.py latest -v
@@ -273,18 +281,29 @@ python PerSpec/Coordination/Scripts/quick_test.py all -p edit --wait
 
 ### ⚠️ Understanding Test Status
 **As of PerSpec v1.6.0**, the `--wait` flag waits for **true completion**:
-- ✅ The DB row has reached a terminal status (`completed`, `failed`, `cancelled`, `timeout`, `inconclusive`)
+- ✅ The DB row has reached a terminal status (`completed`, `failed`, `cancelled`, `timeout`, `inconclusive`, `no_match`)
 - ✅ A matching `TestResults_*.xml` is present in `PerSpec/TestResults/`
   (imported from Unity's AppData fallback if the in-process exporter didn't write one)
 
 Terminal statuses and what they mean:
 - **`completed`** — Unity ran the tests and produced results
-- **`inconclusive`** — Tests ran but produced no usable results (e.g., a method-level run where every test was skipped). Also used when compilation errors prevent execution.
+- **`inconclusive`** — Tests ran but produced no usable results (e.g., a method-level run where every test was skipped). Also used when compilation errors prevent execution. It does NOT mean the name was wrong — that is `no_match`.
+- **`no_match`** — The filter matched **zero tests**. Nothing ran. This is a caller mistake, not a condition of the project, and it is detected before PlayMode is entered. Retrying will not help: read the `error_message`, which names the filter and usually suggests the fully qualified name you meant. `quick_test.py` exits **6**.
 - **`failed`** — Dispatch threw, or orphan recovery flagged the row after a domain reload
-- **`timeout`** — `HandleTestTimeout` fired (>5 min batch / >10 min single)
+- **`timeout`** — `HandleTestTimeout` fired (>5 min batch / >10 min single), or the
+  stuck-run watchdog finalized a run that never reported (>10 min batch / >15 min
+  single). PlayMode runs have no in-process timeout, so the watchdog is the only thing
+  that can end a run wedged inside play mode.
 - **`cancelled`** — User cancelled via CLI
 
-If `quick_test.py --wait` exits 0 and `test_results.py latest -v` shows the run, the tests are truly finished.
+If `quick_test.py --wait` exits 0 and
+`test_results.py latest --for-request <id> -v` shows the run, the tests are truly
+finished.
+
+> **Do not confirm a run with a bare `test_results.py latest`.** It shows the newest
+> XML on disk, which after a timed-out run is the PREVIOUS run's - a silent false
+> green. `--for-request <id>` proves the results belong to the run you asked about and
+> exits non-zero when they cannot be attributed.
 
 ### ⚠️ Understanding Refresh Status
 **As of PerSpec v1.7.0**, `quick_refresh.py --wait` is compile-aware. It blocks through asset import AND any resulting script compilation + domain reload, so `completed` means Unity is running your new code (not just that the import started). The request moves through these statuses:
@@ -877,6 +896,7 @@ python PerSpec/Coordination/Scripts/quick_menu.py cancel <request_id>
 | **After EVERY refresh** | **ALWAYS check errors** | `monitor_editmode_logs.py --errors` |
 | Errors found | FIX before testing | Do NOT run tests |
 | Tests show "inconclusive" | Check compilation | `monitor_editmode_logs.py --errors` |
+| Tests show "no_match" | The filter names nothing — fix the name | Read the `error_message`; it suggests the right one |
 | Tests timeout | Check Unity focus + errors | Click Unity + check errors |
 
 **Test Result States:**
