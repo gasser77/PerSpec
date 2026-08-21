@@ -38,45 +38,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     real `Outer+Inner` spelling.
 - **Exit code 6 from `quick_test.py`** for `no_match`, so a caller can tell "you typed the
   name wrong" apart from "the tests are red" (1) and stop retrying.
-
-### Changed
-- **The after-the-run zero-match paths report `no_match` too**
-  - `TestExecutor.DescribeFilterMismatch`, `PlayModeTestCompletionChecker`, orphan recovery,
-    and the Python `print_summary` downgrade now all distinguish "tests ran and not one was
-    this filter's" (`no_match`) from "nothing ran at all" (`inconclusive`). One status means
-    one thing wherever it is written.
-- **`no_match` never adopts a results file**
-  - No test ran, so no XML can belong to the request. The client no longer waits out the XML
-    grace period for one, and no longer prints a verification line about some other run's
-    file - the same "stale green" hazard that made the original typo take four attempts to
-    find.
-- **The Control Center's "Run Pending Tests" uses the real dispatcher**
-  - `TestCoordinationService` carried a parallel implementation with its own run-state flags
-    and its own filter builder that always used `testNames` - which a class name can never
-    match, so a class dispatched from the Control Center silently ran nothing. It also
-    skipped the `"Both"` platform rejection and could start a run while the coordinator
-    believed none was active. It now forwards to `TestCoordinatorEditor.ProcessTestRequest`.
-
-### Fixed
-- **Terminal rows that were never cleaned up**
-  - `SQLiteManager` and `quick_clean.py` deleted only `completed`/`failed`/`cancelled` rows,
-    so every `timeout` and `inconclusive` request accumulated forever. All terminal statuses
-    are now listed in both.
-- **`Cancelled test request -1`**
-  - The Control Center's cancel logged the request id after clearing it, so it always named
-    `-1`.
-
-### Upgrade notes
-- Existing databases migrate themselves: Unity self-heals the `status` CHECK constraint on
-  load (`DatabaseInitializer`), and `db_auto_maintenance.py` gained an idempotent migration
-  v7. To do it by hand, run
-  `python PerSpec/Coordination/Scripts/db_update_status_constraint.py`.
-- If a database still rejects `no_match`, both the C# and the Python writer detect the
-  rejected write and fall back to `inconclusive` rather than stranding the row mid-flight.
-
-## [1.11.0] - 2026-08-21
-
-### Added
 - **`test_results.py` now names the run it is showing**
   - `latest` and `show` print a `Contains:` line - the number of test-cases and the
     distinct classes they belong to - and `list` prints the same digest under every file.
@@ -116,7 +77,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Prefs: `PerSpec_Watchdog_Enabled`, `PerSpec_Watchdog_TimeoutSeconds` (0 = auto),
     `PerSpec_Watchdog_StopPlayMode` (off by default).
 
+### Changed
+- **The after-the-run zero-match paths report `no_match` too**
+  - `TestExecutor.DescribeFilterMismatch`, `PlayModeTestCompletionChecker`, orphan recovery,
+    and the Python `print_summary` downgrade now all distinguish "tests ran and not one was
+    this filter's" (`no_match`) from "nothing ran at all" (`inconclusive`). One status means
+    one thing wherever it is written.
+- **`no_match` never adopts a results file**
+  - No test ran, so no XML can belong to the request. The client no longer waits out the XML
+    grace period for one, and no longer prints a verification line about some other run's
+    file - the same "stale green" hazard that made the original typo take four attempts to
+    find.
+- **The Control Center's "Run Pending Tests" uses the real dispatcher**
+  - `TestCoordinationService` carried a parallel implementation with its own run-state flags
+    and its own filter builder that always used `testNames` - which a class name can never
+    match, so a class dispatched from the Control Center silently ran nothing. It also
+    skipped the `"Both"` platform rejection and could start a run while the coordinator
+    believed none was active. It now forwards to `TestCoordinatorEditor.ProcessTestRequest`.
+- **`quick_test.py --wait` exits 5 on a timeout**, no longer 1, and says explicitly that NO
+  results were produced for the request, that it is still in status X, and that
+  `test_results.py latest` will therefore show an OLDER run. Points at
+  `latest --for-request <id>` and `stuck --repair`. Exit 1 no longer means "or timed out".
+- **Orphan recovery searches `PerSpec/TestResults` too, and anchors on `started_at`**
+  - It previously probed only Unity's AppData copy and measured age from `created_at`, which
+    is when Python inserted the row - arbitrarily earlier than dispatch when the request
+    queued behind a compile. It now shares one decision ladder with the watchdog
+    (`FinalizeStuckRequest`), differing only in its verdict: `failed` for "the editor
+    restarted and the run is gone", `timeout` for "it may still be alive but blew its
+    ceiling".
+
 ### Fixed
+- **Terminal rows that were never cleaned up**
+  - `SQLiteManager` and `quick_clean.py` deleted only `completed`/`failed`/`cancelled` rows,
+    so every `timeout` and `inconclusive` request accumulated forever. All terminal statuses
+    are now listed in both.
+- **`Cancelled test request -1`**
+  - The Control Center's cancel logged the request id after clearing it, so it always named
+    `-1`.
 - **A PlayMode run that hung could stay `processing` forever**
   - `TestExecutor`'s `MAX_WAIT_TIME` monitor lives on `EditorApplication.update` inside an
     object the enter-PlayMode domain reload destroys, so `HandleTestTimeout` can never fire
@@ -141,18 +138,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     one original caller, wrong the moment a sweep over many rows reuses it. Renamed
     `ResolveRunAnchor` and now checks the marker names the request being asked about.
 
-### Changed
-- **`quick_test.py --wait` exits 5 on a timeout**, no longer 1, and says explicitly that NO
-  results were produced for the request, that it is still in status X, and that
-  `test_results.py latest` will therefore show an OLDER run. Points at
-  `latest --for-request <id>` and `stuck --repair`. Exit 1 no longer means "or timed out".
-- **Orphan recovery searches `PerSpec/TestResults` too, and anchors on `started_at`**
-  - It previously probed only Unity's AppData copy and measured age from `created_at`, which
-    is when Python inserted the row - arbitrarily earlier than dispatch when the request
-    queued behind a compile. It now shares one decision ladder with the watchdog
-    (`FinalizeStuckRequest`), differing only in its verdict: `failed` for "the editor
-    restarted and the run is gone", `timeout` for "it may still be alive but blew its
-    ceiling".
+### Upgrade notes
+- Existing databases migrate themselves: Unity self-heals the `status` CHECK constraint on
+  load (`DatabaseInitializer`), and `db_auto_maintenance.py` gained an idempotent migration
+  v7. To do it by hand, run
+  `python PerSpec/Coordination/Scripts/db_update_status_constraint.py`.
+- If a database still rejects `no_match`, both the C# and the Python writer detect the
+  rejected write and fall back to `inconclusive` rather than stranding the row mid-flight.
 
 ## [1.10.0] - 2026-08-21
 
