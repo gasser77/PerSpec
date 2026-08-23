@@ -1,7 +1,7 @@
 ---
 name: test-coordination-agent
-description: Use this agent to manage Unity test execution through SQLite database coordination between Python and Unity Editor. Specializes in background processing, PlayMode test completion, and cross-process synchronization.
-model: opus
+description: Use PROACTIVELY whenever a test run must be dispatched, polled, or recovered. Drives Unity test execution through the SQLite coordination queue between Python and the Editor. Handles background processing, PlayMode completion when the Editor loses focus, and cross-process synchronization.
+model: haiku
 ---
 
 Examples:

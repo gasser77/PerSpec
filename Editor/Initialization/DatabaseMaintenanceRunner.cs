@@ -210,17 +210,12 @@ namespace PerSpec.Editor.Initialization
         private static string GetMaintenanceScriptPath()
         {
             string projectPath = Directory.GetParent(Application.dataPath).FullName;
-            
-            // First try the working directory (PerSpec/Coordination/Scripts)
-            // This is where the script gets synced to
-            string scriptPath = Path.Combine(projectPath, "PerSpec", "Coordination", "Scripts", "db_auto_maintenance.py");
-            
-            if (File.Exists(scriptPath))
-            {
-                return scriptPath;
-            }
-            
-            // Read package location from package_location.txt
+
+            // Prefer the PACKAGE script over the synced working copy. The working copy in
+            // PerSpec/Coordination/Scripts is only refreshed by a manual sync, so right after
+            // a package update it can be stale and missing newer migrations (e.g. the v6
+            // 'compiling' constraint fix). Migrations are idempotent, so running the always-
+            // current package copy is safe and removes the stale-working-copy trap.
             string packageLocationFile = Path.Combine(projectPath, "PerSpec", "package_location.txt");
             if (File.Exists(packageLocationFile))
             {
@@ -232,11 +227,11 @@ namespace PerSpec.Editor.Initialization
                     {
                         packagePath = Path.Combine(projectPath, packagePath);
                     }
-                    
-                    scriptPath = Path.Combine(packagePath, "Editor", "Coordination", "Scripts", "db_auto_maintenance.py");
-                    if (File.Exists(scriptPath))
+
+                    string packageScript = Path.Combine(packagePath, "Editor", "Coordination", "Scripts", "db_auto_maintenance.py");
+                    if (File.Exists(packageScript))
                     {
-                        return scriptPath;
+                        return packageScript;
                     }
                 }
                 catch (Exception e)
@@ -244,9 +239,16 @@ namespace PerSpec.Editor.Initialization
                     UnityEngine.Debug.LogWarning($"[PerSpec] Could not read package location: {e.Message}");
                 }
             }
-            
+
+            // Fall back to the synced working copy if the package path can't be resolved.
+            string workingCopy = Path.Combine(projectPath, "PerSpec", "Coordination", "Scripts", "db_auto_maintenance.py");
+            if (File.Exists(workingCopy))
+            {
+                return workingCopy;
+            }
+
             // Return the most likely path even if not found
-            return Path.Combine(projectPath, "PerSpec", "Coordination", "Scripts", "db_auto_maintenance.py");
+            return workingCopy;
         }
         
         private static string GetPythonExecutable()

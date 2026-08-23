@@ -49,7 +49,7 @@ It's designed for modern, test-driven development and is perfect for solo develo
     ```json
     "scopedRegistries": [
       {
-        "name": "OpenUPM",
+        "name": "package.openupm.com",
         "url": "https://package.openupm.com",
         "scopes": [
           "com.digitraver.perspec",
@@ -59,11 +59,13 @@ It's designed for modern, test-driven development and is perfect for solo develo
       }
     ],
     "dependencies": {
-      "com.digitraver.perspec": "^1.5.0"
+      "com.digitraver.perspec": "1.8.1"
     }
     ```
 
-    > **Note:** The `^1.5.0` version range automatically installs the latest compatible version (1.5.x, 1.6.x, etc.) while preventing breaking major version updates (2.x). This ensures you get bug fixes and new features automatically.
+    > **Note:** Use an exact version. Unity's project manifest does not support npm-style version ranges such as `^1.8.0`, unlike npm or a package's own `package.json`. To upgrade, change the number and let Unity re-resolve.
+
+    > **Why all three scopes?** PerSpec depends on `com.cysharp.unitask` and `com.gilzoide.sqlite-net`, which are also OpenUPM packages. Omit either scope and Unity queries the default Unity registry instead, which does not host them, producing `Package [com.gilzoide.sqlite-net@1.3.1] cannot be found`. If that happens, run `Tools > PerSpec > Repair Package Dependencies`.
 
     </details>
 

@@ -1,6 +1,6 @@
 ---
 name: dots-performance-profiler
-description: Use this agent to analyze Burst compilation efficiency, job scheduling, and memory allocation patterns in Unity DOTS code. Specializes in profiling NativeArray usage, detecting job dependency bottlenecks, measuring cache efficiency, and identifying non-Burst code paths.
+description: Use PROACTIVELY whenever DOTS code is written or a job system bottleneck is suspected. Analyzes Burst compilation efficiency, job scheduling, and memory allocation patterns. Profiles NativeArray usage, detects job dependency bottlenecks, measures cache efficiency, and identifies non-Burst code paths.
 model: opus
 ---
 

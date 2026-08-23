@@ -28,9 +28,10 @@ def main():
     parser.add_argument('--priority', type=int, default=0,
                        help='Priority level (higher runs first)')
     parser.add_argument('--wait', action='store_true',
-                       help='Wait for refresh completion')
-    parser.add_argument('--timeout', type=int, default=60,
-                       help='Timeout in seconds (default: 60)')
+                       help='Wait until the refresh AND any resulting script compilation '
+                            '+ domain reload finish (i.e. until Unity is running the new code)')
+    parser.add_argument('--timeout', type=int, default=300,
+                       help='Timeout in seconds (default: 300; full recompiles can take minutes)')
     parser.add_argument('--focus', action='store_true',
                        help='Focus Unity window before submitting request (Windows only)')
     

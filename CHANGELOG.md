@@ -27,6 +27,421 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `Documentation/unity-helper-tasks.md` (1219 lines): documented every dispatched scene action — 43 scene + 17 localization sections, plus the `Validate hasComponent` extension.
 - `Documentation/LLM.md`: added "Unity Helper — Augmented Toolbox" section with explicit pre-flight instructions for AI agents to load the action catalogue and JSON Schemas before authoring scenarios/recipes/validator-rules.
 
+## [1.12.0] - 2026-08-21
+
+### Added
+- **`no_match`: a filter that matches nothing is now its own terminal status**
+  - `inconclusive` used to mean three unrelated things at once: tests ran and were all
+    skipped, compilation errors blocked the run, and *the filter named something that does
+    not exist*. Only the third is a caller mistake, and collapsing it with the other two hid
+    the one thing the caller could actually fix. The reported symptom was a wrong namespace
+    submitted three times in a row, because "inconclusive" reads as "flaky, run it again".
+  - A request whose filter resolves to zero tests now ends as `no_match`, with an
+    `error_message` naming the filter. `inconclusive` keeps its honest meaning: the run
+    produced no usable evidence either way.
+- **The filter is resolved BEFORE PlayMode is entered**
+  - New `TestFilterPreflight` walks Unity's test tree via `TestRunnerApi.RetrieveTestList`
+    and answers "does this filter select anything?" without starting a run. The reported case
+    now fails in about a second and never enters PlayMode, instead of costing a full cycle.
+  - Covers `class`, `method` **and** `category`. Categories can be judged properly here for
+    the first time: per-test categories exist in the test tree but not in the NUnit results
+    XML, so the after-the-fact verifier could only ever report them as unverifiable.
+  - Governing rule: a pre-flight that cannot answer returns "could not verify" and lets the
+    run proceed. An empty test tree, a null callback, a 30s watchdog expiry, a malformed
+    category regex, or an explicitly parenthesised filter all fall back to exactly the
+    behaviour that shipped before. A false `no_match` would send a caller to rename a class
+    that was fine - the same failure inverted - so uncertainty never blocks a run.
+- **Near-miss suggestions now catch a wrong namespace, not just a missing one**
+  - `TestResultVerifier.SuggestQualifiedName` gained a second pass matching on the last
+    segment, so `TestProj.Modules.Tests.WidgetAlignerTests` now suggests
+    `TestProj.Core.Tests.WidgetAlignerTests`. The old single pass only handled an
+    omitted prefix, so for the reported bug it produced no suggestion at all.
+  - `+` counts as a segment boundary, so a dotted nested-class filter is answered with the
+    real `Outer+Inner` spelling.
+- **Exit code 6 from `quick_test.py`** for `no_match`, so a caller can tell "you typed the
+  name wrong" apart from "the tests are red" (1) and stop retrying.
+- **`test_results.py` now names the run it is showing**
+  - `latest` and `show` print a `Contains:` line - the number of test-cases and the
+    distinct classes they belong to - and `list` prints the same digest under every file.
+    Derived from the `<test-case fullname>` entries, which are the only ground truth about
+    whose run a file is. The root counts and the file mtime cannot tell one run's output
+    from another's.
+  - The `Timestamp:` line now says `(file mtime, not from the XML)`, which is what it has
+    always silently been.
+- **`test_results.py latest --for-request <id>`**
+  - Reads the request from the coordination database, derives the window in which its
+    results could possibly have been written (`started_at ?? created_at`, minus a 5s
+    clock-skew buffer - the same ladder the C# side uses), and refuses to print anything it
+    cannot attribute to that request.
+  - When the request never finished it exits **5** and prints nothing from any file. This is
+    the reported case: `--wait` timed out, the row was still `processing`, and `latest`
+    happily showed the previous class's green run.
+  - When the request finished but nothing on disk contains its tests, it exits **3** (or 1
+    for a non-`completed` row), naming the classes the candidate files actually hold and,
+    where it can, the fully qualified filter the caller probably meant.
+  - Prints the candidate ledger - every file considered and why it was rejected.
+  - Scores the **matched subset** rather than the file's totals, so `--allow-partial` cannot
+    report a broader run's failures as this request's.
+  - Under `--json`, `results` is `null` whenever the outcome is not `ok`, so a scripted
+    caller is physically unable to read another run's counts.
+- **`test_results.py latest --newer-than <when>`** - a relative age (`15m`, `2h`, `1d`),
+  epoch seconds, or ISO 8601. Exits non-zero when nothing has been written in that window.
+- **Stuck-run watchdog (`TestCoordinatorEditor.TickWatchdog`)**
+  - Guarantees no test request stays non-terminal indefinitely. Sweeps every 30s, driven
+    both from `EditorApplication.update` and from `BackgroundPoller`'s threading timer, so
+    it keeps ticking while the editor is unfocused.
+  - Recovers first and times out last: a run whose completion checker never fired may have
+    written a perfectly good XML that nobody adopted, so the same content-verified recovery
+    ladder runs before any `timeout` is written.
+  - Ceiling is `TestExecutor`'s own ceiling plus a 300s grace (600s batch, 900s single
+    method), deliberately above both the in-process monitor and Python's `--timeout`, so the
+    more precise in-process result always wins when one is possible.
+  - Prefs: `PerSpec_Watchdog_Enabled`, `PerSpec_Watchdog_TimeoutSeconds` (0 = auto),
+    `PerSpec_Watchdog_StopPlayMode` (off by default).
+
+### Changed
+- **The after-the-run zero-match paths report `no_match` too**
+  - `TestExecutor.DescribeFilterMismatch`, `PlayModeTestCompletionChecker`, orphan recovery,
+    and the Python `print_summary` downgrade now all distinguish "tests ran and not one was
+    this filter's" (`no_match`) from "nothing ran at all" (`inconclusive`). One status means
+    one thing wherever it is written.
+- **`no_match` never adopts a results file**
+  - No test ran, so no XML can belong to the request. The client no longer waits out the XML
+    grace period for one, and no longer prints a verification line about some other run's
+    file - the same "stale green" hazard that made the original typo take four attempts to
+    find.
+- **The Control Center's "Run Pending Tests" uses the real dispatcher**
+  - `TestCoordinationService` carried a parallel implementation with its own run-state flags
+    and its own filter builder that always used `testNames` - which a class name can never
+    match, so a class dispatched from the Control Center silently ran nothing. It also
+    skipped the `"Both"` platform rejection and could start a run while the coordinator
+    believed none was active. It now forwards to `TestCoordinatorEditor.ProcessTestRequest`.
+- **`quick_test.py --wait` exits 5 on a timeout**, no longer 1, and says explicitly that NO
+  results were produced for the request, that it is still in status X, and that
+  `test_results.py latest` will therefore show an OLDER run. Points at
+  `latest --for-request <id>` and `stuck --repair`. Exit 1 no longer means "or timed out".
+- **Orphan recovery searches `PerSpec/TestResults` too, and anchors on `started_at`**
+  - It previously probed only Unity's AppData copy and measured age from `created_at`, which
+    is when Python inserted the row - arbitrarily earlier than dispatch when the request
+    queued behind a compile. It now shares one decision ladder with the watchdog
+    (`FinalizeStuckRequest`), differing only in its verdict: `failed` for "the editor
+    restarted and the run is gone", `timeout` for "it may still be alive but blew its
+    ceiling".
+
+### Fixed
+- **Terminal rows that were never cleaned up**
+  - `SQLiteManager` and `quick_clean.py` deleted only `completed`/`failed`/`cancelled` rows,
+    so every `timeout` and `inconclusive` request accumulated forever. All terminal statuses
+    are now listed in both.
+- **`Cancelled test request -1`**
+  - The Control Center's cancel logged the request id after clearing it, so it always named
+    `-1`.
+- **A PlayMode run that hung could stay `processing` forever**
+  - `TestExecutor`'s `MAX_WAIT_TIME` monitor lives on `EditorApplication.update` inside an
+    object the enter-PlayMode domain reload destroys, so `HandleTestTimeout` can never fire
+    for a PlayMode run. `PlayModeTestCompletionChecker` only acts on `EnteredEditMode`. And
+    `RecoverOrphanedRequests` ran **only from the `[InitializeOnLoad]` static constructor** -
+    that is, only on a domain reload, which a run wedged inside play mode never triggers.
+  - Between them, nothing was watching. The row stayed non-terminal, `--wait` gave up at its
+    client-side timeout, and orphan recovery never saw the request at all.
+- **A wedged run could disable testing for the rest of the editor session**
+  - `_isRunningTests` stayed `true` for the stuck request, and it is the first guard in
+    `TryDispatchNextRequest`, so every later request was silently refused. The watchdog now
+    tears the local run down - but only for a request this session actually owns.
+- **`timeout` and `inconclusive` rows had a NULL `completed_at`**
+  - `UpdateStatusBase` stamped `CompletedAt` only for `completed|failed|cancelled`, yet
+    `RecoverOrphanedRequests` really does call `UpdateRequestStatus(id, "inconclusive", ...)`.
+    Any reader keying off that column saw a finished request as still running.
+- **`test_results.py failed` listed every failure once per failure**
+  - `all_failed.extend(failed)` sat inside the loop that stamped each test, so a file with
+    four failures printed all four of them four times.
+- **`ResolveDispatchTime` read the SessionState dispatch stamp for any request**
+  - The stamp describes whichever request is currently marked in-flight. Harmless for its
+    one original caller, wrong the moment a sweep over many rows reuses it. Renamed
+    `ResolveRunAnchor` and now checks the marker names the request being asked about.
+
+### Upgrade notes
+- Existing databases migrate themselves: Unity self-heals the `status` CHECK constraint on
+  load (`DatabaseInitializer`), and `db_auto_maintenance.py` gained an idempotent migration
+  v7. To do it by hand, run
+  `python PerSpec/Coordination/Scripts/db_update_status_constraint.py`.
+- If a database still rejects `no_match`, both the C# and the Python writer detect the
+  rejected write and fall back to `inconclusive` rather than stranding the row mid-flight.
+
+## [1.10.0] - 2026-08-21
+
+### Added
+- **Five generalized Unity subagents**
+  - `unity-log-triage` (`haiku`) owns `monitor_editmode_logs.py` and `test_playmode_logs.py`
+    in all their forms. Returns the distinct errors, their counts, and first occurrence -
+    not the log. Knows that PlayMode capture is sampled every 5 seconds, so a missing line
+    is not proof an event did not happen.
+  - `unity-test-runner` (`haiku`) owns the refresh, verify, run loop. Stops and reports if
+    compilation errors exist instead of running anyway, keeps `--timeout` at 300s or above,
+    and returns pass/fail **sets** rather than counts so runs can be compared to each other.
+  - `unity-scene-inspector` (`sonnet`) owns every scene, prefab, and asset content
+    question, answered through `scene_hierarchy.py`. Megabytes of JSON in, one line out.
+  - `unity-codebase-scout` (`sonnet`) handles find-usages and find-implementations across a
+    large project, and always reports which roots it actually searched.
+  - `unity-asmdef-doctor` (`haiku`) diagnoses assembly definition wiring, including the
+    signature where a `MenuItem` in a runtime assembly never registers and `quick_menu.py`
+    reports that as a timeout rather than as "not found".
+- **"Analyze with the export, never by reading YAML" rule in `LLM.md`**
+  - The hierarchy export is now documented as the supported way to inspect scene and
+    prefab contents. It resolves GUIDs and fileIDs, applies prefab overrides, and honours
+    `m_RemovedComponents`, so it reports what the scene actually contains. Reading raw
+    `.unity` or `.prefab` YAML burns hundreds of thousands of lines of context for an
+    answer the export hands over in one field.
+  - Covers scoping the export narrowly, finding the answer with `grep -n` rather than
+    `cat`, leaving `--show` off, and what to do when the export genuinely cannot answer.
+- **Model tier table in `LLM.md`**
+  - Documents when to pick `haiku`, `sonnet`, or `opus`, with relative cache-read cost, so
+    tier choice is a recorded decision rather than a default.
+- **Standing delegation authorization in `LLM.md`**
+  - States plainly that the user has pre-authorized delegation, so a subagent does not need
+    to be requested per task. Paired with a positive trigger list and a short "handle inline"
+    list.
+
+### Changed
+- **Five agents retiered off `opus`**
+  - `test-coordination-agent` to `haiku`; `batch-refactor-agent`, `architecture-agent`,
+    `test-writer-agent`, and `refactor-agent` to `sonnet`.
+  - `dots-performance-profiler` stays on `opus`. Burst and job-dependency analysis is
+    genuine reasoning, not volume work.
+  - Every tool call re-reads the whole context, so cost tracks context size multiplied by
+    call count. Agents pinned to the top tier for mechanical work were paying top-tier cache
+    reads for work with no judgment in it.
+- **All agent `description:` fields rewritten**
+  - Each now leads with an imperative and names its trigger condition
+    ("Use PROACTIVELY whenever ..."). The previous passive "Use this agent to ..." phrasing
+    is rarely picked by automatic agent selection, so the tier settings were never exercised.
+- **`LLM.md` agent section replaced**
+  - The "Score 1-3 / 4-7 / 8+" decision matrix, the "When to Use Agents" table with its
+    explicit NO rows, and the `Task(...)` pseudo-code examples are gone. They set the bar at
+    "complex feature, 5+ files", which almost no daily task clears, so delegation never
+    happened.
+  - The `Available Agents` list is now a table of all eleven agents with their tier. It
+    previously omitted `test-coordination-agent`, which existed as a file the whole time.
+
+## [1.9.0] - 2026-08-13
+
+### Added
+- **Content verification for every test result file**
+  - New `TestResultVerifier` (C#) and `results_verification.py` (Python) answer one question:
+    do the `<test-case fullname>` entries in this XML actually belong to the request that is
+    about to adopt them? Every path that could mark a request terminal now goes through it.
+  - The verdict is three-way rather than a boolean. `Exact` is the healthy outcome for a
+    filtered run and is required while a run may still be live. `Partial` means the file is
+    from a broader run; it is accepted only at the true end of a run, and reports the matching
+    subset rather than the whole file's counts. `None` and `Empty` are never adopted.
+  - Category runs report `Unverifiable`: NUnit output carries no category information, so they
+    are still accepted on their timestamp, but the row says so instead of implying a match.
+  - When an unqualified class name matches nothing, the verifier suggests the fully qualified
+    name it found in the results, so the failure is actionable.
+- **`quick_test.py` fails fast when the Unity Editor is not responding**
+  - Unity writes a heartbeat to `system_status` about once a second. Nothing on the Python
+    side ever read it, so a request submitted while the editor was restarting sat in `pending`
+    until the full 300-second timeout expired with no explanation.
+  - `--wait` now aborts within seconds with `UnityNotRespondingError` and exit code **4**, and
+    a warning is printed up front if the editor is already silent at submit time.
+- **Staleness guards in `test_results.py`**
+  - `latest` prints the age of the results it is showing, and warns loudly when they are more
+    than an hour old.
+  - Unity's AppData `TestResults.xml` is no longer imported when it is older than 24 hours.
+    New `--max-age <hours>` and `--allow-stale` flags on `latest` and `list`.
+- **`TestResultVerifierTests`** EditMode suite covering right class, wrong class, empty run,
+  partial match, parameterised names, synthetic files, `all` and `category`.
+
+### Fixed
+- **A test run could report a different class's results as its own**
+  - Symptom: `quick_test.py class B -p play --wait` printed `Status: completed`, echoed
+    `Filter: B`, and reported 6 passing tests - which were class A's tests from the previous
+    run. Class B never executed.
+  - Root cause: the NUnit filter was correct all along
+    (`^Namespace\.Class(\.|$)`, escaped and anchored). The failure was in result *attribution* -
+    four separate code paths chose which XML belonged to a request using file modification
+    time alone, which cannot tell one run's output from another's.
+  - All four now verify contents first: `TestExecutor.CheckAndProcessResultFile`,
+    `PlayModeTestCompletionChecker.ParseXmlAndUpdateRequest`,
+    `TestCoordinatorEditor.TryRecoverFromResultFile`, and the AppData import paths.
+  - `RunFinished` additionally checks the in-memory callback results against the filter, which
+    catches the case Unity cannot report: a filter resolving to zero tests still produces a
+    clean, empty, "successful" run.
+- **Entering PlayMode was treated as a crash, causing a duplicate dispatch**
+  - Entering play mode always triggers a domain reload, and exiting it triggers another.
+    `[InitializeOnLoad]` constructors run *before* `playModeStateChanged(EnteredEditMode)`, so
+    `RecoverInterruptedTestRequest` reached the row before `PlayModeTestCompletionChecker` had
+    any chance to finish it, and re-queued a live run to `pending`. The request was then
+    dispatched a second time and the duplicate could adopt the first run's results.
+  - The in-play reload is now recognised and skipped. The exit reload hands off to
+    `PlayModeTestCompletionChecker` and only falls back to the interruption ladder if the row
+    is still non-terminal 15 seconds later. A genuine editor crash is unaffected - SessionState
+    does not survive a restart, so that case was always owned by the 3-minute orphan sweep.
+- **An empty result XML no longer reports `completed`**
+  - `PlayModeTestCompletionChecker` marked a run with zero test-cases as `completed` with
+    `Total: 0`. A run that executed nothing is `inconclusive`.
+- **The XML exporter counted every pass twice**
+  - `TestFinished` incremented the counters once per finished node - suites included - and then
+    `RunFinished` walked the tree and counted the leaves again. An 18-test run exported
+    `total="18" passed="44"` with a summary claiming `Pass Rate: 244.4%`, and every path that
+    parsed those attributes wrote the inflated numbers into the database.
+  - `RunFinished` now resets the counters before its tree walk, which counts leaves only, and
+    `TestFinished` no longer stores suite nodes.
+- **Three `now - 5 minutes` fallback windows replaced**
+  - Used when a dispatch time was unknown, each was wide enough to swallow the previous run's
+    results. The dispatch time now falls back through SessionState, `started_at`, `created_at`,
+    and finally to "adopt nothing" - not knowing when a run started must not mean accepting
+    anything recent.
+- **`PerSpec/TestResults` is trimmed instead of emptied**
+  - Wiping the directory before every dispatch destroyed the evidence needed to tell runs
+    apart, and left the "newer than anything local" heuristic comparing against an empty
+    folder - so any AppData XML, however old, looked like the freshest results available.
+    The five most recent runs are now kept.
+- **`"TestFramework"` is no longer a preferred product name for every project**
+  - The AppData scan hard-coded it, ranking an unrelated project's stale results above the
+    real ones. Company and product are now read from `ProjectSettings.asset`, and once any
+    folder matches this project the scan no longer falls through to folders that do not.
+- **`update_system_heartbeat` never wrote anything**
+  - The statement used a `?` placeholder with no bindings and an `ON CONFLICT(component)`
+    clause on a column with no UNIQUE constraint, and the resulting error was swallowed.
+    Rewritten as SELECT-then-UPDATE-or-INSERT.
+- **`--wait` no longer accepts any XML when `created_at` cannot be parsed**
+  - It now falls back to "written since we started waiting" instead of the newest file on disk.
+
+### Changed
+- **`quick_test.py --wait` exit codes are now meaningful**: `0` verified pass, `1` failed or
+  timed out, `2` compilation errors, `3` results did not match the requested filter, `4` Unity
+  not responding. Scripted callers can no longer read a mismatch as success.
+- **The summary prints `Requested filter:` and `Verified:`** side by side. The first is what you
+  asked for, the second is what the results actually contain. When they disagree the run is
+  reported loudly and the row is corrected to `inconclusive`.
+- **Unqualified class filters now surface as `inconclusive` rather than a green pass.** This is
+  not a behaviour regression: Unity's anchored `^MyTests(\.|$)` regex never matched
+  `Namespace.MyTests.Method`, so those runs were already executing nothing and only appeared to
+  pass by adopting another run's file. The error message names the qualified filter to use.
+- **`.summary.txt` is no longer preferred over the XML** when both exist. It carries the same
+  counts with no test names attached, so it cannot be verified.
+
+## [1.8.1] - 2026-08-07
+
+### Added
+- **Dependency preflight that explains a missing package instead of vanishing**
+  - Every PerSpec editor assembly depends on `com.gilzoide.sqlite-net`, directly or transitively
+    (`Initialization` -> `Services` -> `Coordination` -> `Gilzoide.SqliteNet`). When that package
+    fails to resolve, all of them fail to compile, the `Tools > PerSpec` menu disappears, and no
+    PerSpec code survives to say why. The user is left with a bare
+    `Package [com.gilzoide.sqlite-net@1.3.1] cannot be found` naming a package they never asked for.
+  - New `PerSpec.Editor.Preflight` assembly with **zero assembly references**, so it is the one
+    that still compiles when the rest of the package cannot. It must stay reference-free.
+  - On load it checks every dependency declared in `package.json` using the synchronous
+    `PackageInfo.GetAllRegisteredPackages()`. When all are present it logs nothing at all.
+  - When one is missing it logs a single error naming the package, what it is needed for, whether
+    the package comes from OpenUPM or the Unity registry, and whether `Packages/manifest.json` is
+    actually missing the scope or the download simply failed. Gated on `SessionState` so a domain
+    reload does not repeat it.
+- **`Tools > PerSpec > Repair Package Dependencies`**
+  - Registered in the preflight assembly, so it is reachable precisely when the rest of the menu is not.
+  - Copies a correct `scopedRegistries` block to the clipboard and offers to reveal
+    `manifest.json`. It does not edit the manifest itself: `UnityEditor.PackageManager.Client` has
+    no `AddScopedRegistry` in 6000.3, so an automated path would mean hand-merging JSON into the
+    one file that gates the entire project, and a bad merge there is far worse than one paste.
+  - Reads the manifest as raw text and scans only inside the `scopedRegistries` array, so a package
+    id listed under `dependencies` is not mistaken for a scope. No JSON library is used, because
+    `com.unity.nuget.newtonsoft-json` is itself on the list of things that may be missing.
+
+### Fixed
+- **Install instructions pointed at a repository that does not exist**
+  - `Documentation/quick-start.md` told users to
+    `git clone https://github.com/yourusername/perspec.git Packages/com.perspec.framework`.
+    Both the URL and the package name were wrong, and the scoped registry went unmentioned, so
+    anyone following it landed straight in the resolution failure above.
+  - Replaced with the OpenUPM CLI route plus a manual `manifest.json` block listing all three
+    required scopes.
+- **Package version was hardcoded and had drifted five minor releases**
+  - `PerSpecInitializer.cs` carried `private const string CURRENT_VERSION = "1.3.1"` with the
+    comment "Should match package.json". It did not: the package was shipping 1.8.x.
+  - It was the fallback whenever `PackageInfo.FindForPackageName` returned null, so any failed
+    lookup pushed the recorded version backwards to 1.3.1. The next successful lookup then read
+    as a fresh upgrade and re-ran the entire update flow: re-copying Python scripts, rewriting LLM
+    configuration, and popping the update window for a package that had not changed.
+  - Replaced with a resolver that reads the version from the package itself, preferring
+    `PackageInfo.FindForAssembly` (which works for registry, embedded and local installs, and does
+    not depend on a package-name string staying in sync) and falling back to `FindForPackageName`.
+  - When neither can answer, it now reports `unknown` and skips the update check rather than
+    inventing a number, since storing a placeholder is what faked the upgrade in the first place.
+    The first-run setup window still appears when the project is uninitialized.
+- **README recommended a version range Unity does not support**
+  - The manual install block used `"com.digitraver.perspec": "^1.5.0"` and claimed the range would
+    track 1.5.x and 1.6.x automatically. Unity's project manifest accepts exact versions only;
+    npm-style ranges are not supported there. Corrected to an exact version with a note explaining
+    the difference.
+  - Also documents why all three scopes are required and points at the new repair menu item.
+
+## [1.8.0] - 2026-08-07
+
+### Fixed
+- **EditMode tests got stuck and never executed (primary fix)**
+  - Symptom: a submitted EditMode request sat at `pending`, or reached `processing`/`executing` and never moved. `quick_test.py --wait` then burned its full 300s timeout with no explanation.
+  - Root cause: both background pollers called `CompilationPipeline.RequestScriptCompilation()` in the *same main-thread callback* that had just called `TestRunnerApi.Execute()`. The forced compile triggered a domain reload that destroyed the in-flight `TestExecutor`, its `EditorApplication.update` file monitor and its registered `ICallbacks` — so nothing was left alive to finish the run or write a terminal status. `AssetRefreshCoordinator` removed this same anti-pattern in 1.7.0; the test dispatch path never got the fix.
+  - The forced compile is gone from both `BackgroundPoller` and `TestCoordinatorEditor`. The user-invoked `Force Script Compilation` action in the Control Center is unchanged.
+- **Duplicate dispatch from three independent pollers** — `TestCoordinatorEditor`'s update loop, its own timer, and `BackgroundPoller` each read `test_requests` and dispatched. `BackgroundPoller.ProcessPendingTestRequest` never checked whether a run was already active, and its `_isProcessing` guard was released when the main-thread callback was *queued* rather than when it completed, so a second dispatch could be queued behind the first. All wake-up sources now funnel through a single guarded `TestCoordinatorEditor.TryDispatchNextRequest()`.
+- **Class-level test runs matched zero tests** — `CreateTestFilter` put the class name in `Filter.testNames`, which requires an exact full-name match a class name can never satisfy. Runs "completed" with 0 tests. Class requests now use `Filter.groupNames` with an anchored regex, selecting the class and every method beneath it.
+- **`timeout` and `inconclusive` statuses were immediately overwritten** — `OnTestComplete` unconditionally wrote `failed`/`completed` over the precise status `TestExecutor` had just written, so a timed-out run reported `failed` and a skipped-only run reported `completed`. Terminal statuses are now never downgraded.
+- **Requests could be stranded at `finalizing` forever** — `RunFinished` set its completion flag and stopped file monitoring *before* saving results, so any exception in between left the row with no remaining path to a terminal state. Result persistence is now isolated so the terminal write always happens, and a late failure marks the request `failed` instead of parking it.
+- **Orphan recovery always discarded real results** — `FindAppDataTestResult` probed `LocalAppData\Unity\Editor\TestResults.xml`, but Unity writes to `LocalAppDataLow\{Company}\{Product}\`. Recovery therefore never found results and marked every interrupted run `failed`. All recovery paths now share one candidate-path helper (`TestExecutor.GetAppDataResultCandidatePaths`).
+- **TestRunnerApi callbacks leaked between runs** — the file-monitor completion path never called `Cleanup()`, and a later `RunFinished` early-returned before reaching its own cleanup. Stale `TestResultXMLExporter` instances accumulated and wrote extra XML on every subsequent run. The file-monitor and timeout paths now tear down fully.
+- **Coordination could be silently disabled for a whole session** — a locked or unreadable database made `SQLiteManager` initialization fail without a word, and both pollers then returned from their static constructors in silence. All three now log a single explicit warning.
+- **`EditorPrefs` was read from a ThreadPool thread** in `BackgroundPoller.BackgroundPollCallback`, outside the try block. A throw there killed the timer callback and left the processing flag latched on. The value is now cached from the main thread, and a watchdog releases the flag if a queued main-thread dispatch never runs.
+- **`StartedAt` was never set on the real pipeline** — it was stamped only for the `running` status, which the live path never writes (it writes `processing` then `executing`), leaving every duration fallback dead. Now stamped on the first active status, once.
+- **`quick_test.py` pre-flight compilation check never worked** — it shelled out to `quick_logs.py`, a script that no longer exists, so it always reported "[OK] No compilation errors" and never blocked a doomed run. It now reads the newest EditMode session log directly via `monitor_editmode_logs`.
+- **Maintenance migration v3 could delete live requests** — `DELETE FROM test_requests WHERE created_at < datetime('now','-7 days')` compared INT64 tick values against text. SQLite sorts all integers before all text, so the predicate was unconditionally true for tick-stored rows. The delete is now split by `typeof(created_at)` with a matching tick cutoff.
+
+### Added
+- **Compile and play-mode dispatch guards** — a run is never started while Unity is compiling, importing assets, or entering play mode. Blocked requests stay `pending` and dispatch on a later tick, so they self-heal with no user action.
+- **Domain-reload persistence and recovery for test runs** — the in-flight request id and dispatch time are stored in `SessionState` (parity with the 1.7.0 refresh work). After a reload, `RecoverInterruptedTestRequest` completes the run from results found on disk, otherwise re-queues it for **one** automatic retry, otherwise marks it `failed`. A request is never left non-terminal.
+- **Self-healing `test_requests` CHECK constraint in C#** — mirrors the existing `asset_refresh_requests` repair. A database created by an older Python initializer that rejects `finalizing`/`timeout`/`inconclusive` is rebuilt on editor load, instead of silently freezing rows at their previous status.
+- **`quick_test.py stuck [--repair]`** — lists every non-terminal request with its status and age; `--repair` cancels them. Plain `quick_test.py status` now also reports in-flight requests, not just pending ones.
+- **Actionable hint while waiting** — if a request is still `pending` after 15 seconds, `--wait` explains the likely causes (unfocused editor, compiling, coordination disabled) instead of staying silent until timeout.
+- **`TestExecutor.Abort()`** — tears down a cancelled run's monitor and callbacks so they do not leak into the next run.
+
+### Changed
+- **`-p both` submits two separate requests** (EditMode then PlayMode). Unity cannot run both modes in a single `TestRunnerApi.Execute` call; the combined form is now rejected in C# with a clear message instead of silently running nothing.
+- **`cancel` covers all non-terminal statuses** — previously only `pending` and `running` could be cancelled, so a request wedged at `processing`/`executing`/`finalizing` (exactly the one needing intervention) could not be cleared from Python.
+- **`TestCoordinatorEditor`'s internal polling timer is disabled by default** — `BackgroundPoller` already owns the unfocused-editor wake-up for both tests and refreshes and now funnels into the shared dispatch entry point. The timer code remains and can be re-enabled; only the duplication is gone.
+
+## [1.7.1] - 2026-07-10
+
+### Fixed
+- **`CHECK constraint failed` spam on every compilation for databases created before 1.7.0**
+  - Symptom: `[SQLiteManager] Error updating status: CHECK constraint failed: status IN ('pending', 'running', 'completed', 'failed', 'cancelled')`, thrown from `AssetRefreshCoordinator.OnCompilationStarted` → `SQLiteManager.UpdateRefreshRequestStatus` whenever the two-phase refresh wrote the new `compiling` status.
+  - Root cause: a SQLite CHECK constraint is frozen at `CREATE TABLE` time. A DB file created by a pre-1.7.0 `db_initializer.py` kept the old 5-value `asset_refresh_requests` constraint. The v6 fix migration reached users unreliably — it ran the *synced working-copy* script (stale until a manual `sync_python_scripts.py`), and after any exit-0 run it bumped the package-version EditorPref, suppressing the version-triggered retry for 7 days.
+  - **Self-healing repair in C#** — `DatabaseInitializer` now verifies the `asset_refresh_requests` status constraint on every editor load (not just when the DB file is missing) and rebuilds the table to add `compiling` if absent. This is the pure-C# equivalent of Python migration v6 and needs no `python` on PATH and no script sync. The C# `CREATE TABLE` for `asset_refresh_requests` now also carries the full CHECK constraint, so the C# and Python create-paths agree.
+  - **Maintenance runner now prefers the package script** — `DatabaseMaintenanceRunner.GetMaintenanceScriptPath()` resolves the always-current package copy of `db_auto_maintenance.py` before the synced working copy, removing the stale-working-copy trap for the Python migration path.
+
+### Added
+- **"Initialize / Migrate Database" button in Control Center** — Test Coordinator → Database Maintenance. Creates the DB if missing and upgrades a stale schema on demand (runs the C# self-heal plus the full Python migration sweep). Available even when the database is not yet initialized.
+
+## [1.7.0] - 2026-07-06
+
+### Added
+- **Two-phase, compile-aware asset refresh completion**
+  - `quick_refresh.py --wait` now blocks until asset import AND any resulting script compilation + domain reload have finished, instead of returning the instant asset import started. When it reports `completed`, Unity is running the new code. This mirrors the v1.6.x work that made `quick_test.py --wait` wait for true completion.
+  - New `compiling` refresh status. A request now moves `pending → running → compiling → completed`. `running` means Unity received the request and is importing assets; `compiling` means scripts are recompiling with a domain reload pending; `completed` is only written after the domain reload (or immediately when no compilation was triggered).
+  - `AssetRefreshCoordinator` subscribes to `CompilationPipeline.compilationStarted/compilationFinished`. On a successful compile it writes `completed` from the post-domain-reload `[InitializeOnLoad]` recovery pass (`RecoverInterruptedRequests`), so completion is proof the new assemblies are loaded. When compilation finishes with errors (no domain reload occurs), the still-loaded `compilationFinished` handler finalizes the request as `completed` with an `error_message` so the poller never hangs — error triage remains workflow step 3 (`monitor_editmode_logs.py --errors`).
+  - Post-reload recovery also rescues requests orphaned in `running`/`compiling` by a domain reload or editor restart (stale `compiling` > 30 min and `running` > 10 min are marked `failed`), fixing a pre-existing bug where an interrupted `running` refresh row was never recovered.
+  - Schema migration **v6** adds `compiling` to the `asset_refresh_requests` status CHECK constraint (`db_auto_maintenance.py`), targeting the real `asset_refresh_requests` table. Constraint also updated in `db_initializer.py` and `add_refresh_table.py` for fresh databases.
+
+### Fixed
+- **`quick_refresh.py --wait` returning while Unity was still compiling** — the coordinator marked a refresh `completed` as soon as asset import finished (via the `AssetPostprocessor` callback or a 2-frame `delayCall` fallback), before script compilation and domain reload. Callers then checked for compile errors / ran tests against stale, still-compiling state. Completion is now gated on compilation + domain reload.
+- **Refresh row deleted mid-flight by `created_at` type-affinity corruption** — `asset_refresh_coordinator.py` inserted `created_at` as ISO **text**, which Unity's sqlite-net coerced to the integer `2026` on the first status `Update`; a maintenance `DELETE ... WHERE created_at < cutoff` during the domain reload then wiped the still-in-flight request (surfacing as `Request N not found`). This is the same corruption fixed for `test_requests` in v1.6.0; `created_at` is now written as .NET INT64 ticks via a `_dotnet_ticks_now()` helper. Before v1.7.0 a refresh completed in ~0.1s so the row was gone before cleanup ran and the bug stayed latent. `print_summary` also now renders tick timestamps as readable dates instead of the raw integer / corrupted `2026`.
+- **No-compile refresh could hang until timeout when Unity was unfocused** — the no-change completion path is driven by a bounded `EditorApplication.delayCall` chain (like the original fallback) rather than a wall-clock window, so it still finishes in a few frames when editor `update` ticks stall on an idle/unfocused editor.
+- **Orphaned `running` refresh rows never recovered** — a refresh interrupted by a domain reload left its row stuck in `running` forever. `RecoverInterruptedRequests` now reconciles these after each reload.
+- **`db_auto_maintenance.py` re-running the newest migration every invocation** — `get_schema_version` ordered by `applied_at` (1-second resolution), so migrations committed in the same second tied and could report an older version. It now uses `MAX(version)`.
+
+### Changed
+- Default refresh `--timeout` raised from 60s to **300s** (`quick_refresh.py`, `asset_refresh_coordinator.py`) since a full recompile + domain reload can take minutes. `wait_for_completion` now prints per-phase progress with elapsed time and names the phase it was stuck in on timeout; `print_summary` prints a `[WARNING] Compilation errors detected` line when a `completed` refresh carries an `error_message`.
+- Removed the forced `CompilationPipeline.RequestScriptCompilation()` in the background-poll path of `AssetRefreshCoordinator`. It forced a full recompile on every unfocused-Unity refresh; `AssetDatabase.Refresh` already schedules compilation when scripts actually changed, so under the compile-aware semantics the forced compile only added a needless reload.
+
 ## [1.6.1] - 2026-05-13
 
 ### Documentation

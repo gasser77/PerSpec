@@ -1,7 +1,6 @@
 using System;
 using System.IO;
 using System.Linq;
-using System.Text.RegularExpressions;
 using UnityEngine;
 using UnityEditor;
 using PerSpec.Editor.TestExport;
@@ -64,68 +63,35 @@ namespace PerSpec.Editor.Coordination
                 // Pick the most-recently-started request to update
                 var requestToUpdate = runningRequests.OrderByDescending(r => r.Id).FirstOrDefault();
 
+                if (requestToUpdate == null)
+                {
+                    return;
+                }
+
                 // Only consider XML files written after this request started (minus a 5-second
                 // clock-skew buffer) so we never pick up a stale file from a previous run.
-                DateTime? minTime = requestToUpdate?.StartedAt.HasValue == true
+                DateTime? minTime = requestToUpdate.StartedAt.HasValue
                     ? requestToUpdate.StartedAt.Value.AddSeconds(-5)
                     : (DateTime?)null;
 
-                // Look for the latest test result file that matches the current run
-                var latestResultFile = GetLatestResultFile(minTime);
+                // Look for the latest test result file that belongs to the current run
+                var latestResultFile = GetLatestResultFile(minTime, requestToUpdate);
 
                 if (!string.IsNullOrEmpty(latestResultFile))
                 {
                     Debug.Log($"[PlayModeTestCompletionChecker] Found result file: {latestResultFile}");
-
-                    if (requestToUpdate != null)
-                    {
-                        // Parse XML and update with actual results
-                        ParseXmlAndUpdateRequest(latestResultFile, requestToUpdate, dbManager);
-                    }
+                    ParseXmlAndUpdateRequest(latestResultFile, requestToUpdate, dbManager);
                 }
                 else
                 {
-                    Debug.Log("[PlayModeTestCompletionChecker] No test result files found in PerSpec/TestResults, checking Unity default location...");
-                    
-                    // Check Unity's default location and copy if found
-                    var copiedFile = CopyFromUnityDefaultLocation();
-                    if (!string.IsNullOrEmpty(copiedFile))
-                    {
-                        Debug.Log($"[PlayModeTestCompletionChecker] Copied test results from Unity default location to: {copiedFile}");
-                        
-                        // Parse the copied file
-                        string summaryPath = copiedFile.Replace(".xml", ".summary.txt");
-                        if (File.Exists(summaryPath))
-                        {
-                            var summary = ParseSummaryFile(summaryPath);
-                            
-                            // Update the most recent running request (reuse outer variable)
-                            requestToUpdate = runningRequests.OrderByDescending(r => r.Id).First();
-                            
-                            Debug.Log($"[PlayModeTestCompletionChecker] Updating request {requestToUpdate.Id} with results from copied file");
-                            
-                            dbManager.UpdateRequestResults(
-                                requestToUpdate.Id,
-                                "completed",
-                                summary.TotalTests,
-                                summary.PassedTests,
-                                summary.FailedTests,
-                                summary.SkippedTests,
-                                summary.Duration
-                            );
-                            
-                            dbManager.LogExecution(requestToUpdate.Id, "INFO", "PlayModeTestCompletionChecker", 
-                                $"Test completed (copied from Unity default): {summary.PassedTests}/{summary.TotalTests} passed");
-                            
-                            Debug.Log($"[PlayModeTestCompletionChecker] Request {requestToUpdate.Id} marked as completed");
-                        }
-                        else
-                        {
-                            // Parse XML file directly if no summary
-                            ParseXmlAndUpdateRequest(copiedFile, runningRequests.OrderByDescending(r => r.Id).First(), dbManager);
-                        }
-                    }
-                    else
+                    Debug.Log("[PlayModeTestCompletionChecker] No usable result files in PerSpec/TestResults, checking Unity default location...");
+
+                    // Check Unity's default location and copy if found. That helper already
+                    // routes through ParseXmlAndUpdateRequest, which is now the single path
+                    // that can mark a PlayMode request terminal - the old summary-file branch
+                    // here wrote 'completed' from numbers no one could verify.
+                    var copiedFile = CopyFromUnityDefaultLocation(requestToUpdate);
+                    if (string.IsNullOrEmpty(copiedFile))
                     {
                         Debug.LogWarning("[PlayModeTestCompletionChecker] No test results found in any location");
                     }
@@ -137,157 +103,119 @@ namespace PerSpec.Editor.Coordination
             }
         }
         
-        private static string GetLatestResultFile(DateTime? minModifiedTime = null)
+        /// <summary>
+        /// Newest result file that both post-dates the run and actually contains the run's tests.
+        /// A timestamp alone cannot tell one run's output from another's, which is how a request
+        /// for one class ended up reporting a different class's results.
+        /// </summary>
+        private static string GetLatestResultFile(DateTime? minModifiedTime, TestRequest request)
         {
             if (!Directory.Exists(_testResultsPath)) return null;
 
-            var xmlFiles = Directory.GetFiles(_testResultsPath, "*.xml")
+            var candidates = Directory.GetFiles(_testResultsPath, "*.xml")
                 .Select(f => new FileInfo(f))
                 .Where(fi => minModifiedTime == null || fi.LastWriteTime >= minModifiedTime.Value)
                 .OrderByDescending(fi => fi.LastWriteTime)
                 .Select(fi => fi.FullName)
-                .FirstOrDefault();
+                .ToList();
 
-            return xmlFiles;
-        }
-        
-        private static TestResultSummary ParseSummaryFile(string summaryPath)
-        {
-            var summary = new TestResultSummary();
-            var lines = File.ReadAllLines(summaryPath);
-            
-            foreach (var line in lines)
+            // This runs at the true end of the run, so a broader run's file is better than
+            // nothing - it is adopted with its matching subset only.
+            string chosen = TestResultVerifier.PickBest(candidates, request, true, out var verification);
+
+            if (chosen == null && candidates.Count > 0)
             {
-                if (line.Contains("Total Tests:"))
-                {
-                    if (int.TryParse(Regex.Match(line, @"\d+").Value, out int totalTests))
-                        summary.TotalTests = totalTests;
-                }
-                else if (line.Contains("Passed:"))
-                {
-                    if (int.TryParse(Regex.Match(line, @"\d+").Value, out int passedTests))
-                        summary.PassedTests = passedTests;
-                }
-                else if (line.Contains("Failed:"))
-                {
-                    if (int.TryParse(Regex.Match(line, @"\d+").Value, out int failedTests))
-                        summary.FailedTests = failedTests;
-                }
-                else if (line.Contains("Skipped:"))
-                {
-                    if (int.TryParse(Regex.Match(line, @"\d+").Value, out int skippedTests))
-                        summary.SkippedTests = skippedTests;
-                }
-                else if (line.Contains("Duration:"))
-                {
-                    var match = Regex.Match(line, @"[\d.]+");
-                    if (match.Success)
-                    {
-                        if (float.TryParse(match.Value, out float duration))
-                            summary.Duration = duration;
-                    }
-                }
+                TestResultVerifier.LogRejection("PlayModeTestCompletionChecker", verification);
             }
-            
-            return summary;
+
+            return chosen;
         }
         
-        private static string CopyFromUnityDefaultLocation()
+        /// <summary>
+        /// Imports Unity's own TestResults.xml when the in-process exporter did not write one
+        /// (the usual case for PlayMode, where the domain reload kills the callbacks).
+        ///
+        /// The candidate must post-date the request AND contain the request's tests. The old
+        /// flat "modified in the last 5 minutes" window was wide enough to import the previous
+        /// run's results and report them as this run's.
+        /// </summary>
+        private static string CopyFromUnityDefaultLocation(TestRequest request)
         {
             try
             {
                 string appDataPath = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData) + "Low";
-                
-                // Try multiple possible locations in order of likelihood
-                string[] possiblePaths = new string[]
+
+                // Shared candidate list so every recovery path probes the same folders.
+                string[] possiblePaths = TestExecutor.GetAppDataResultCandidatePaths().ToArray();
+
+                // Anchor freshness to the request itself rather than to wall-clock now.
+                DateTime cutoff = request?.StartedAt ?? request?.CreatedAt ?? DateTime.MaxValue;
+                if (cutoff != DateTime.MaxValue)
                 {
-                    // Primary: Use actual company and product names from Unity settings
-                    Path.Combine(appDataPath, Application.companyName, Application.productName),
-                    
-                    // Fallback 1: DefaultCompany with actual product name
-                    Path.Combine(appDataPath, "DefaultCompany", Application.productName),
-                    
-                    // Fallback 2: Hardcoded for TestFramework project (backward compatibility)
-                    Path.Combine(appDataPath, "DefaultCompany", "TestFramework"),
-                    
-                    // Fallback 3: DefaultCompany with project folder name
-                    Path.Combine(appDataPath, "DefaultCompany", Path.GetFileName(Directory.GetParent(Application.dataPath).FullName))
-                };
-                
-                string sourceFile = null;
-                string foundPath = null;
-                DateTime? fileModifiedTime = null;
-                
-                // Try each possible path
-                foreach (var testPath in possiblePaths)
-                {
-                    string candidateFile = Path.Combine(testPath, "TestResults.xml");
-                    if (File.Exists(candidateFile))
-                    {
-                        var fileInfo = new FileInfo(candidateFile);
-                        fileModifiedTime = fileInfo.LastWriteTime;
-                        
-                        // Only use files modified in the last 5 minutes to avoid stale results
-                        if ((DateTime.Now - fileModifiedTime.Value).TotalMinutes <= 5)
-                        {
-                            sourceFile = candidateFile;
-                            foundPath = testPath;
-                            Debug.Log($"[PlayModeTestCompletionChecker] Found recent test results at: {candidateFile} (modified {fileModifiedTime.Value})");
-                            break;
-                        }
-                        else
-                        {
-                            Debug.Log($"[PlayModeTestCompletionChecker] Ignoring stale test results at: {candidateFile} (modified {fileModifiedTime.Value})");
-                        }
-                    }
+                    cutoff = cutoff.AddSeconds(-5);  // clock-skew buffer
                 }
-                
+
+                string sourceFile = null;
+
+                foreach (var candidateFile in possiblePaths)
+                {
+                    if (!File.Exists(candidateFile))
+                    {
+                        continue;
+                    }
+
+                    var fileInfo = new FileInfo(candidateFile);
+                    if (fileInfo.LastWriteTime < cutoff)
+                    {
+                        Debug.Log($"[PlayModeTestCompletionChecker] Ignoring stale test results at: " +
+                                  $"{candidateFile} (modified {fileInfo.LastWriteTime:s}, cutoff {cutoff:s})");
+                        continue;
+                    }
+
+                    var verification = TestResultVerifier.Verify(candidateFile, request);
+                    if (!verification.CanAdoptAsLastResort)
+                    {
+                        TestResultVerifier.LogRejection("PlayModeTestCompletionChecker", verification);
+                        continue;
+                    }
+
+                    sourceFile = candidateFile;
+                    Debug.Log($"[PlayModeTestCompletionChecker] Found matching test results at: " +
+                              $"{candidateFile} (modified {fileInfo.LastWriteTime:s})");
+                    break;
+                }
+
                 if (sourceFile == null)
                 {
-                    Debug.Log($"[PlayModeTestCompletionChecker] No test results found. Searched locations:");
+                    Debug.Log($"[PlayModeTestCompletionChecker] No usable test results found. Searched locations:");
                     foreach (var path in possiblePaths)
                     {
-                        Debug.Log($"  - {Path.Combine(path, "TestResults.xml")}");
+                        Debug.Log($"  - {path}");
                     }
                     return null;
                 }
-                
+
                 // Ensure TestResults directory exists
                 if (!Directory.Exists(_testResultsPath))
                     Directory.CreateDirectory(_testResultsPath);
-                
+
                 // Copy with timestamp
                 string timestamp = DateTime.Now.ToString("yyyyMMdd_HHmmss");
                 string destFile = Path.Combine(_testResultsPath, $"TestResults_{timestamp}.xml");
                 File.Copy(sourceFile, destFile, true);
-                
+
                 Debug.Log($"[PlayModeTestCompletionChecker] Copied from {sourceFile} to {destFile}");
-                Debug.Log($"[PlayModeTestCompletionChecker] Company: {Application.companyName}, Product: {Application.productName}");
-                
-                // Parse the copied XML file and update database with results
-                try 
+
+                try
                 {
                     var dbManager = new SQLiteManager();
-                    var runningRequests = dbManager.GetRunningRequests()
-                        .Where(r => r.TestPlatform == "PlayMode")
-                        .OrderByDescending(r => r.Id)
-                        .FirstOrDefault();
-                    
-                    if (runningRequests != null)
-                    {
-                        // Parse XML and update with actual results
-                        ParseXmlAndUpdateRequest(destFile, runningRequests, dbManager);
-                    }
-                    else
-                    {
-                        Debug.Log("[PlayModeTestCompletionChecker] No running PlayMode requests to update");
-                    }
+                    ParseXmlAndUpdateRequest(destFile, request, dbManager);
                 }
                 catch (Exception ex)
                 {
                     Debug.LogError($"[PlayModeTestCompletionChecker] Failed to update database: {ex.Message}");
                 }
-                
+
                 return destFile;
             }
             catch (Exception e)
@@ -297,109 +225,108 @@ namespace PerSpec.Editor.Coordination
             }
         }
         
+        /// <summary>
+        /// The single path that can mark a PlayMode request terminal from a results file.
+        ///
+        /// Counts come from the matching test-case leaves, so a broader run's file reports only
+        /// this request's subset, and the pre-1.9.0 double-counted root attributes are ignored.
+        /// </summary>
         private static void ParseXmlAndUpdateRequest(string xmlPath, TestRequest request, SQLiteManager dbManager)
         {
             try
             {
-                var doc = System.Xml.Linq.XDocument.Load(xmlPath);
-                var testRun = doc.Root;
-                
-                if (testRun != null)
+                var verification = TestResultVerifier.Verify(xmlPath, request);
+
+                float duration = verification.Duration;
+                if (duration <= 0.1f && request.StartedAt.HasValue)
                 {
-                    int totalTests = int.Parse(testRun.Attribute("total")?.Value ?? "0");
-                    int passedTests = int.Parse(testRun.Attribute("passed")?.Value ?? "0");
-                    int failedTests = int.Parse(testRun.Attribute("failed")?.Value ?? "0");
-                    int skippedTests = int.Parse(testRun.Attribute("skipped")?.Value ?? "0");
-                    float duration = float.Parse(testRun.Attribute("duration")?.Value ?? "0");
-                    
-                    // Check if this is an empty result (Unity generates empty XML for individual tests)
-                    if (totalTests == 0 && request.RequestType == "method")
-                    {
-                        Debug.Log($"[PlayModeTestCompletionChecker] Empty XML for individual test method - generating proper XML");
-                        
-                        // Generate a proper XML file for the individual test
-                        try
-                        {
-                            string generatedXmlPath = SingleTestXMLGenerator.GenerateInconclusiveTestXML(
-                                request.TestFilter, 
-                                request.TestPlatform
-                            );
-                            
-                            Debug.Log($"[PlayModeTestCompletionChecker] Generated XML for individual test at: {generatedXmlPath}");
-                        }
-                        catch (Exception ex)
-                        {
-                            Debug.LogError($"[PlayModeTestCompletionChecker] Failed to generate XML: {ex.Message}");
-                        }
-                        
-                        // Calculate actual duration from request start time
-                        float actualDuration = 0.1f; // Default if we can't calculate
-                        if (request.StartedAt.HasValue)
-                        {
-                            actualDuration = (float)(DateTime.Now - request.StartedAt.Value).TotalSeconds;
-                            Debug.Log($"[PlayModeTestCompletionChecker] Calculated actual duration: {actualDuration:F2} seconds");
-                        }
-                        
-                        // For individual test methods with empty results, mark as inconclusive
-                        // Use "inconclusive" status instead of "completed" to avoid false positives
-                        dbManager.UpdateRequestResults(
-                            request.Id,
-                            "inconclusive",  // Changed from "completed" to prevent false positives
-                            1,  // Assume 1 test was requested
-                            0,  // Unknown pass count
-                            0,  // Unknown fail count
-                            1,  // Mark as skipped/inconclusive
-                            actualDuration  // Use actual duration instead of hardcoded 0.1f
-                        );
-                        
-                        dbManager.LogExecution(request.Id, "WARNING", "PlayModeTestCompletionChecker", 
-                            $"Individual test ran for {actualDuration:F2}s but Unity did not generate proper results - marked as inconclusive");
-                        
-                        Debug.LogWarning($"[PlayModeTestCompletionChecker] Unity did not generate test results for individual method. " +
-                                       $"Generated workaround XML file. Test may have run but results are unavailable.");
-                    }
-                    else if (totalTests == 0)
-                    {
-                        Debug.LogWarning($"[PlayModeTestCompletionChecker] Empty test results - no tests were run");
-                        
-                        dbManager.UpdateRequestResults(
-                            request.Id,
-                            "completed",
-                            0,
-                            0,
-                            0,
-                            0,
-                            duration
-                        );
-                        
-                        dbManager.LogExecution(request.Id, "WARNING", "PlayModeTestCompletionChecker", 
-                            "Test execution completed but no tests were run");
-                    }
-                    else
-                    {
-                        Debug.Log($"[PlayModeTestCompletionChecker] Parsed XML - Total: {totalTests}, Passed: {passedTests}, Failed: {failedTests}");
-                        
-                        dbManager.UpdateRequestResults(
-                            request.Id,
-                            "completed",
-                            totalTests,
-                            passedTests,
-                            failedTests,
-                            skippedTests,
-                            duration
-                        );
-                        
-                        dbManager.LogExecution(request.Id, "INFO", "PlayModeTestCompletionChecker", 
-                            $"Test completed (parsed from XML): {passedTests}/{totalTests} passed");
-                    }
-                    
-                    Debug.Log($"[PlayModeTestCompletionChecker] Request {request.Id} marked as completed from XML");
+                    duration = (float)(DateTime.Now - request.StartedAt.Value).TotalSeconds;
                 }
+
+                // Unity is known to write a completely empty XML for some single-method runs.
+                if (verification.Match == TestResultMatch.Empty && request.RequestType == "method")
+                {
+                    Debug.Log($"[PlayModeTestCompletionChecker] Empty XML for individual test method - generating placeholder XML");
+
+                    try
+                    {
+                        string generatedXmlPath = SingleTestXMLGenerator.GenerateInconclusiveTestXML(
+                            request.TestFilter,
+                            request.TestPlatform
+                        );
+
+                        Debug.Log($"[PlayModeTestCompletionChecker] Generated XML for individual test at: {generatedXmlPath}");
+                    }
+                    catch (Exception ex)
+                    {
+                        Debug.LogError($"[PlayModeTestCompletionChecker] Failed to generate XML: {ex.Message}");
+                    }
+
+                    FinalizeRequest(dbManager, request, "inconclusive", 1, 0, 0, 1, duration,
+                        $"Individual test ran for {duration:F2}s but Unity produced no results");
+                    return;
+                }
+
+                // Nothing executed, or nothing that belongs to this request. Either way this is
+                // not evidence the requested tests passed - it must never be reported as green.
+                // 'no_match' when tests ran but none were this filter's (a wrong name, which
+                // the caller can fix); 'inconclusive' when nothing ran at all.
+                if (verification.IsDefinitiveMiss)
+                {
+                    Debug.LogWarning($"[PlayModeTestCompletionChecker] {verification.Reason}");
+
+                    FinalizeRequest(dbManager, request, verification.MissStatus, 0, 0, 0, 0, duration,
+                        verification.Reason);
+                    return;
+                }
+
+                if (!verification.CanAdoptAsLastResort)
+                {
+                    // Unreadable file - leave the request alone so a later pass can retry.
+                    TestResultVerifier.LogRejection("PlayModeTestCompletionChecker", verification);
+                    return;
+                }
+
+                // A generated placeholder is not the record of a real run.
+                string status = verification.IsSynthetic ? "inconclusive" : "completed";
+                string reason = verification.Match == TestResultMatch.Exact && !verification.IsSynthetic
+                    ? null
+                    : verification.Reason;
+
+                Debug.Log($"[PlayModeTestCompletionChecker] Verified XML - Matched: {verification.MatchedCases}, " +
+                          $"Passed: {verification.Passed}, Failed: {verification.Failed} ({verification.Reason})");
+
+                FinalizeRequest(dbManager, request, status,
+                    verification.MatchedCases,
+                    verification.Passed,
+                    verification.Failed,
+                    verification.Skipped + verification.Inconclusive,
+                    duration,
+                    reason);
             }
             catch (Exception e)
             {
                 Debug.LogError($"[PlayModeTestCompletionChecker] Error parsing XML file: {e.Message}");
             }
+        }
+
+        /// <summary>
+        /// Writes the terminal status and hands the in-flight marker back to the coordinator, so
+        /// its domain-reload recovery does not later mistake a finished run for an interrupted one.
+        /// </summary>
+        private static void FinalizeRequest(SQLiteManager dbManager, TestRequest request, string status,
+                                            int total, int passed, int failed, int skipped,
+                                            float duration, string reason)
+        {
+            dbManager.UpdateRequestResults(request.Id, status, total, passed, failed, skipped, duration, reason);
+
+            dbManager.LogExecution(request.Id, status == "completed" ? "INFO" : "WARNING",
+                "PlayModeTestCompletionChecker",
+                reason ?? $"Test {status} (parsed from XML): {passed}/{total} passed");
+
+            Debug.Log($"[PlayModeTestCompletionChecker] Request {request.Id} marked as '{status}' from XML");
+
+            TestCoordinatorEditor.NotifyRequestFinalizedExternally(request.Id);
         }
         
         // Integrated into main coordinator - accessed via Control Center

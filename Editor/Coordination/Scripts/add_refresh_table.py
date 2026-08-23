@@ -54,7 +54,7 @@ def add_refresh_table():
                 refresh_type TEXT NOT NULL DEFAULT 'full' CHECK(refresh_type IN ('full', 'selective')),
                 paths TEXT,
                 import_options TEXT DEFAULT 'default' CHECK(import_options IN ('default', 'synchronous', 'force_update')),
-                status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending', 'running', 'completed', 'failed', 'cancelled')),
+                status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending', 'running', 'compiling', 'completed', 'failed', 'cancelled')),
                 priority INTEGER DEFAULT 0,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 started_at TIMESTAMP,

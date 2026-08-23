@@ -1,7 +1,7 @@
 ---
 name: batch-refactor-agent
-description: Use this agent to perform batch refactoring operations across multiple C# files using scripts and automation. Specializes in adding regions, updating namespaces, generating XML documentation, enforcing code style, converting async void to UniTask, and generating test files.
-model: opus
+description: Use PROACTIVELY whenever the same mechanical change must be applied across many C# files. Performs batch refactoring with scripts and automation - adding regions, updating namespaces, generating XML documentation, enforcing code style, converting async void to UniTask, and generating test files.
+model: sonnet
 script-template: ../../CustomScripts/README.md
 ---
 

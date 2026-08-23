@@ -1,13 +1,7 @@
 {
-    "name": "PerSpec.Editor.Windows",
-    "rootNamespace": "PerSpec.Editor.Windows",
-    "references": [
-        "PerSpec.Runtime",
-        "PerSpec.Editor.Services",
-        "PerSpec.Editor.Coordination",
-        "PerSpec.Editor.Initialization",
-        "UniTask"
-    ],
+    "name": "PerSpec.Editor.Preflight",
+    "rootNamespace": "PerSpec.Editor.Preflight",
+    "references": [],
     "includePlatforms": [
         "Editor"
     ],

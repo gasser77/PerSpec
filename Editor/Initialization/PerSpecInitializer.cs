@@ -20,12 +20,66 @@ namespace PerSpec.Editor.Initialization
         // Version tracking
         private const string VERSION_PREF_KEY = "PerSpec_LastKnownVersion";
         private const string PACKAGE_NAME = "com.digitraver.perspec";
-        private const string CURRENT_VERSION = "1.3.1";  // Should match package.json
+
+        /// <summary>Returned when the package version genuinely cannot be determined.</summary>
+        private const string UNKNOWN_VERSION = "unknown";
+
+        private static string _resolvedVersion;
+
+        /// <summary>
+        /// The running package version, read from the package itself.
+        ///
+        /// This used to be a hardcoded "1.3.1  // Should match package.json" constant, and it did
+        /// not: it sat at 1.3.1 while the package shipped 1.8.x. Whenever the lookup below fell
+        /// back to it, the stored version lurched backwards, and the next successful lookup read
+        /// as a fresh upgrade - re-running the whole update flow, re-copying Python scripts and
+        /// popping the update window, on a package that had not changed at all.
+        /// </summary>
+        private static string CurrentVersion
+        {
+            get
+            {
+                if (string.IsNullOrEmpty(_resolvedVersion))
+                {
+                    _resolvedVersion = ResolvePackageVersion();
+                }
+                return _resolvedVersion;
+            }
+        }
+
+        private static string ResolvePackageVersion()
+        {
+            // Resolving by assembly works for registry, embedded and local installs alike, and
+            // does not depend on a package name string staying in sync.
+            try
+            {
+                var byAssembly = UnityEditor.PackageManager.PackageInfo.FindForAssembly(
+                    typeof(PerSpecInitializer).Assembly);
+                if (byAssembly != null && !string.IsNullOrEmpty(byAssembly.version))
+                {
+                    return byAssembly.version;
+                }
+            }
+            catch { /* fall through to the name lookup */ }
+
+            try
+            {
+                var byName = UnityEditor.PackageManager.PackageInfo.FindForPackageName(PACKAGE_NAME);
+                if (byName != null && !string.IsNullOrEmpty(byName.version))
+                {
+                    return byName.version;
+                }
+            }
+            catch { /* fall through */ }
+
+            // Better to admit ignorance than to invent a number that fakes an upgrade later.
+            return UNKNOWN_VERSION;
+        }
         
         // Update detection
         private bool isUpdate = false;
         private string previousVersion = "";
-        private string currentVersion = CURRENT_VERSION;
+        private string currentVersion = CurrentVersion;
         private bool updateHasFailures = false;
         private string updateFailureMessages = "";
         
@@ -63,8 +117,22 @@ namespace PerSpec.Editor.Initialization
             try
             {
                 // Get current package version
-                var packageInfo = UnityEditor.PackageManager.PackageInfo.FindForPackageName(PACKAGE_NAME);
-                string detectedVersion = packageInfo != null ? packageInfo.version : CURRENT_VERSION;
+                string detectedVersion = CurrentVersion;
+
+                if (detectedVersion == UNKNOWN_VERSION)
+                {
+                    // Version unknown means "changed?" is unanswerable. Storing a placeholder here
+                    // would make the next successful lookup look like an upgrade, so store nothing
+                    // and leave the recorded version alone.
+                    Debug.LogWarning("[PerSpec] Could not determine the package version; skipping the update check.");
+
+                    if (!Directory.Exists(ProjectPerSpecPath) && !hasShownThisSession)
+                    {
+                        hasShownThisSession = true;
+                        ShowWindow();
+                    }
+                    return;
+                }
 
                 // Get last known version from EditorPrefs
                 string lastKnownVersion = EditorPrefs.GetString(VERSION_PREF_KEY, "");

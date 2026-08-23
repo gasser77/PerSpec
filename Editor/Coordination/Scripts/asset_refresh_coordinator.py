@@ -12,7 +12,7 @@ os.environ['PYTHONDONTWRITEBYTECODE'] = '1'
 import sqlite3
 import json
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from enum import Enum
 from typing import Optional, List, Dict, Any
@@ -33,6 +33,44 @@ def get_db_path():
     perspec_dir.mkdir(exist_ok=True)
     return str(perspec_dir / "test_coordination.db")
 
+
+_DOTNET_EPOCH = datetime(1, 1, 1)
+
+def _dotnet_ticks_now() -> int:
+    """Return the current local time as .NET DateTime.Now.Ticks.
+
+    sqlite-net (Unity side) defaults to StoreDateTimeAsTicks=true and stores
+    `created_at` as an INT64 tick count of local time since 0001-01-01. If Python
+    INSERTs a TEXT timestamp instead, a later sqlite-net `_connection.Update(entity)`
+    (every status change) reads the column, SQLite coerces the TEXT via NUMERIC
+    affinity to its leading integer prefix (e.g. "2026-07-06T..." becomes 2026), and
+    writes back 2026 as INT64. Subsequent maintenance `DELETE WHERE created_at < ?`
+    then matches and deletes the still-in-flight request.
+
+    Before v1.7.0 a refresh completed in ~0.1s, so the row was gone before cleanup
+    ran and the corruption was harmless. Now that a refresh is held through the
+    'compiling' + domain-reload phases (seconds), cleanup can delete it mid-flight -
+    so we write INT64 ticks up front, exactly as test_coordinator.py does.
+    """
+    delta = datetime.now() - _DOTNET_EPOCH
+    # DateTime.Ticks is 100-nanosecond intervals; preserve microsecond precision.
+    return delta.days * 864_000_000_000 + delta.seconds * 10_000_000 + delta.microseconds * 10
+
+def _format_db_timestamp(value):
+    """Render a created_at/started_at/completed_at value as a readable local datetime.
+
+    Values are stored as .NET INT64 ticks (by both Python and Unity's sqlite-net);
+    older rows may still hold ISO text. Return the input unchanged if it can't be parsed.
+    """
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        try:
+            return (_DOTNET_EPOCH + timedelta(microseconds=int(value) / 10)).strftime('%Y-%m-%d %H:%M:%S')
+        except (OverflowError, ValueError):
+            return str(value)
+    return str(value)
+
 class RefreshType(Enum):
     FULL = "full"
     SELECTIVE = "selective"
@@ -43,10 +81,11 @@ class ImportOptions(Enum):
     FORCE_UPDATE = "force_update"
 
 class RefreshStatus(Enum):
-    PENDING = "pending"
-    RUNNING = "running"
-    COMPLETED = "completed"
-    FAILED = "failed"
+    PENDING = "pending"       # queued, Unity has not yet picked it up
+    RUNNING = "running"       # Unity received it, importing assets
+    COMPILING = "compiling"   # scripts recompiling, domain reload pending
+    COMPLETED = "completed"   # refresh + any compilation + domain reload finished
+    FAILED = "failed"         # the refresh request itself could not be processed
     CANCELLED = "cancelled"
 
 class AssetRefreshCoordinator:
@@ -86,8 +125,11 @@ class AssetRefreshCoordinator:
             # Convert paths list to JSON string if provided
             paths_json = json.dumps(paths) if paths else None
             
+            # Write created_at as .NET INT64 ticks so sqlite-net round-trips it safely.
+            # See _dotnet_ticks_now() docstring for the SQLite type-affinity corruption
+            # (and mid-flight row deletion) this avoids.
             cursor.execute("""
-                INSERT INTO asset_refresh_requests 
+                INSERT INTO asset_refresh_requests
                 (refresh_type, paths, import_options, status, priority, created_at)
                 VALUES (?, ?, ?, 'pending', ?, ?)
             """, (
@@ -95,7 +137,7 @@ class AssetRefreshCoordinator:
                 paths_json,
                 import_options.value,
                 priority,
-                datetime.now().isoformat()
+                _dotnet_ticks_now()
             ))
             
             request_id = cursor.lastrowid
@@ -138,32 +180,49 @@ class AssetRefreshCoordinator:
         finally:
             conn.close()
     
-    def wait_for_completion(self, request_id: int, timeout: int = 60) -> str:
-        """Wait for a refresh request to complete"""
+    # Human-readable description of each non-terminal phase
+    _PHASE_TEXT = {
+        'pending': "Queued - waiting for Unity to pick up the request...",
+        'running': "Unity is importing assets...",
+        'compiling': "Unity is compiling scripts (domain reload pending)...",
+    }
+
+    def wait_for_completion(self, request_id: int, timeout: int = 300) -> str:
+        """Wait for a refresh request to fully complete.
+
+        'completed' is only reported once Unity has finished importing assets AND any
+        resulting script compilation + domain reload have finished, so it means Unity is
+        running the new code. Full recompiles can take minutes - hence the 300s default.
+        """
         start_time = time.time()
         last_status = None
-        
+
         print(f"Waiting for refresh request #{request_id} to complete...")
-        
+
         while time.time() - start_time < timeout:
             status_data = self.get_request_status(request_id)
-            
+
             if not status_data:
                 print(f"[ERROR] Request #{request_id} not found")
                 return "not_found"
-            
+
             current_status = status_data['status']
-            
+
             if current_status != last_status:
-                print(f"  Status: {current_status}")
+                elapsed = time.time() - start_time
+                phase = self._PHASE_TEXT.get(current_status, "")
+                suffix = f" - {phase}" if phase else ""
+                print(f"  Status: {current_status} ({elapsed:.1f}s){suffix}")
                 last_status = current_status
-            
+
             if current_status in ['completed', 'failed', 'cancelled']:
                 return current_status
-            
+
             time.sleep(0.5)
-        
-        print(f"[WARNING] Timeout waiting for request #{request_id}")
+
+        phase = self._PHASE_TEXT.get(last_status, last_status)
+        print(f"[WARNING] Timeout after {timeout}s waiting for request #{request_id} "
+              f"(last phase: {last_status} - {phase})")
         return "timeout"
     
     def cancel_request(self, request_id: int) -> bool:
@@ -236,29 +295,36 @@ class AssetRefreshCoordinator:
             print(f"Paths: {', '.join(status_data['paths'])}")
         
         if status_data.get('created_at'):
-            print(f"Created: {status_data['created_at']}")
-        
+            print(f"Created: {_format_db_timestamp(status_data['created_at'])}")
+
         if status_data.get('started_at'):
-            print(f"Started: {status_data['started_at']}")
-        
+            print(f"Started: {_format_db_timestamp(status_data['started_at'])}")
+
         if status_data.get('completed_at'):
-            print(f"Completed: {status_data['completed_at']}")
+            print(f"Completed: {_format_db_timestamp(status_data['completed_at'])}")
         
         if status_data.get('duration_seconds'):
             print(f"Duration: {status_data['duration_seconds']:.2f} seconds")
         
         if status_data.get('result_message'):
             print(f"Result: {status_data['result_message']}")
-        
+
         if status_data.get('error_message'):
             print(f"Error: {status_data['error_message']}")
-        
-        print(f"{'='*60}\n")
+
+        print(f"{'='*60}")
+
+        # A 'completed' refresh with an error_message means compilation produced CS errors.
+        # The refresh itself succeeded, but the code will not run until the errors are fixed.
+        if status_data.get('status') == 'completed' and status_data.get('error_message'):
+            print("[WARNING] Compilation errors detected - run "
+                  "monitor_editmode_logs.py --errors before running tests")
+        print()
 
 # Convenience functions
 def refresh_all_assets(import_options: ImportOptions = ImportOptions.DEFAULT,
                        wait: bool = False,
-                       timeout: int = 60) -> int:
+                       timeout: int = 300) -> int:
     """Quick function to refresh all assets"""
     coordinator = AssetRefreshCoordinator()
     request_id = coordinator.submit_refresh_request(
@@ -275,7 +341,7 @@ def refresh_all_assets(import_options: ImportOptions = ImportOptions.DEFAULT,
 def refresh_specific_paths(paths: List[str],
                           import_options: ImportOptions = ImportOptions.DEFAULT,
                           wait: bool = False,
-                          timeout: int = 60) -> int:
+                          timeout: int = 300) -> int:
     """Quick function to refresh specific paths"""
     coordinator = AssetRefreshCoordinator()
     request_id = coordinator.submit_refresh_request(

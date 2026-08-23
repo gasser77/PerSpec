@@ -52,7 +52,7 @@ def create_database():
                 status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN (
                     'pending', 'processing', 'executing', 'finalizing',
                     'running', 'completed', 'failed', 'timeout',
-                    'cancelled', 'inconclusive'
+                    'cancelled', 'inconclusive', 'no_match'
                 )),
                 priority INTEGER DEFAULT 0,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -117,7 +117,7 @@ def create_database():
                 refresh_type TEXT NOT NULL DEFAULT 'full' CHECK(refresh_type IN ('full', 'selective')),
                 paths TEXT,
                 import_options TEXT DEFAULT 'default' CHECK(import_options IN ('default', 'synchronous', 'force_update')),
-                status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending', 'running', 'completed', 'failed', 'cancelled')),
+                status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending', 'running', 'compiling', 'completed', 'failed', 'cancelled')),
                 priority INTEGER DEFAULT 0,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 started_at TIMESTAMP,
@@ -127,7 +127,7 @@ def create_database():
                 error_message TEXT
             )
         """)
-        
+
         # Create console_logs table for Unity console output capture
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS console_logs (

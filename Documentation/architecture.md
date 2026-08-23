@@ -122,8 +122,15 @@ STATES = [
     'finalizing',    # Test run produced results; writing to DB
     'completed',     # Terminal: tests finished and results persisted
     'failed',        # Terminal: dispatch threw OR orphan recovery flagged it
-    'timeout',       # Terminal: HandleTestTimeout fired (>5min batch, >10min single)
+    'timeout',       # Terminal: HandleTestTimeout fired (>5min batch, >10min
+                     # single), OR the stuck-run watchdog finalized a run that
+                     # never reported. PlayMode has no in-process timeout - the
+                     # enter-playmode domain reload destroys TestExecutor's
+                     # monitor - so the watchdog is the only thing that can end a
+                     # run wedged inside play mode.
     'cancelled',     # Terminal: user cancelled via Python CLI or UI
+    'no_match',      # Terminal: the filter matched zero tests - nothing ran.
+                     # A caller mistake, caught before PlayMode is entered.
     'inconclusive',  # Terminal: tests ran but produced no usable results
                      # (e.g. method-level run where every test was skipped)
     'running',       # Legacy alias retained for back-compat
@@ -196,7 +203,7 @@ CREATE TABLE test_requests (
     status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN (
         'pending', 'processing', 'executing', 'finalizing',
         'running', 'completed', 'failed', 'timeout',
-        'cancelled', 'inconclusive'
+        'cancelled', 'inconclusive', 'no_match'
     )),
     priority INTEGER DEFAULT 0,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,  -- Python overrides with .NET ticks
@@ -321,7 +328,7 @@ def wait_for_completion(self, request_id, timeout=300,
     falls back to importing Unity's AppData TestResults.xml if PerSpec's
     copy never materialized.
     """
-    terminal = {'completed', 'failed', 'cancelled', 'timeout', 'inconclusive'}
+    terminal = {'completed', 'failed', 'cancelled', 'timeout', 'inconclusive', 'no_match'}
     consecutive_misses = 0
     while time.time() - start < timeout:
         status = self.get_request_status(request_id)
@@ -457,6 +464,31 @@ Editor/Coordination/
      - File size has been stable for `FILE_STABILITY_WAIT` (3s)
   6. Method-level runs whose entire result set is `Skipped` are written
      with terminal status `'inconclusive'` rather than `'completed'`
+  7. `DescribeFilterMismatch` reports which kind of miss occurred: tests ran and
+     none belong to the filter is `'no_match'`; nothing ran at all stays
+     `'inconclusive'`, because a broken run explains that just as well
+
+#### TestFilterPreflight
+- **Purpose**: Answer "does this filter select anything?" before a run starts
+- **Runs**: between `CreateTestFilter` and `ExecuteTests`, inside
+  `TestCoordinatorEditor.ProcessTestRequest` / `OnPreflightResolved`
+- **Mechanism**: `TestRunnerApi.RetrieveTestList(testMode, callback)`, then leaf
+  `FullName`s (and `Categories`) matched with the same `TestResultVerifier.IsMatch`
+  the post-run verifier uses. It starts no run and never enters PlayMode.
+- **Why**: a filter matching zero tests used to cost a full PlayMode cycle and land
+  on `'inconclusive'` — the same status as a compile failure — so a typo was
+  indistinguishable from a project condition and got retried instead of fixed.
+- **Asynchrony**: `RetrieveTestList` hangs its job off `EditorApplication.update`,
+  so it never returns inline and its callback does **not** survive a domain reload.
+  Hence a 30s watchdog, and `SessionKeyPreflight` so a reload in that window
+  re-queues the request rather than hunting for an XML that cannot exist.
+- **Never blocks a runnable request**: an empty tree, a null root, watchdog expiry,
+  a malformed category regex, or a parenthesised filter all resolve to
+  `CouldNotVerify`, which proceeds exactly as before this check existed. A false
+  `'no_match'` would send the caller to rename something that was fine.
+- **`testMode` is taken from the Filter**, not re-derived from `TestPlatform`: a
+  PlayMode-only class is absent from the EditMode tree, so a mismatch here would
+  false-report every PlayMode request.
 
 #### PlayModeTestCompletionChecker
 - **Purpose**: Last-resort PlayMode completion detection after Play mode exit
@@ -470,7 +502,8 @@ Editor/Coordination/
      `%LocalAppDataLow%\<Company>\<Product>\TestResults.xml` candidates
      and imports the first fresh one
   4. Parse XML and `UpdateRequestResults`; empty result sets for method
-     runs become `'inconclusive'`
+     runs become `'inconclusive'`, while a file whose tests all belong to some
+     other filter becomes `'no_match'` (`TestResultVerification.MissStatus`)
 
 ### Assembly Structure
 
@@ -755,6 +788,7 @@ Long-standing "Request N not found" failure on `quick_test.py method ... -p play
 3. **`EnsureResultXmlInPerSpec()` in `TestExecutor.RunFinished`**: copies Unity's AppData `TestResults.xml` into `PerSpec/TestResults/` if neither the XML exporter callback nor file monitoring already did, guaranteeing `test_results.py latest` can see the file.
 4. **`RecoverOrphanedRequests` safety gate**: re-verifies request age in C# before marking anything `failed`, defending against future SQL false-positives.
 5. **Status CHECK constraint includes `'inconclusive'`**: new `apply_migration_v5` in `db_auto_maintenance.py`; `db_update_status_constraint.py` is now idempotent.
+6. **Status CHECK constraint includes `'no_match'`** (v1.12.0): `apply_migration_v7` in `db_auto_maintenance.py`, plus the C# self-heal in `DatabaseInitializer.EnsureTestStatusConstraint`. Both writers verify the write landed and fall back to `'inconclusive'` rather than stranding a row when the schema is older.
 6. **Python `wait_for_completion` hardened**: tolerates up to 10 consecutive missing-row reads, waits for the XML artifact before returning, falls back to importing from `%LocalAppDataLow%` if PerSpec's copy never materialized. `--wait` now means "Unity actually finished and results are on disk."
 7. **`test_results.py` multi-directory scan**: enumerates AppData fallback locations when nothing fresh exists in `PerSpec/TestResults/`.
 8. **Fixed migration v4 typo** (`menu_requests` → `menu_item_requests`) that had been silently breaking the migration chain.

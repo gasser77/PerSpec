@@ -303,10 +303,13 @@ namespace PerSpec.Editor.Coordination
                 _connection.BusyTimeout = TimeSpan.FromSeconds(5);
                 _isInitialized = true;
             }
-            catch (Exception)
+            catch (Exception e)
             {
                 _isInitialized = false;
-                // Silent failure - database might be locked or not ready
+                // A locked or unreadable database silently disabled all coordination, so
+                // requests sat pending with no clue why. Say so once, loudly.
+                Debug.LogWarning($"[SQLiteManager] Could not open {_dbPath} - PerSpec coordination is DISABLED " +
+                                 $"for this session: {e.Message}");
             }
         }
         
@@ -347,16 +350,28 @@ namespace PerSpec.Editor.Coordination
                     statusProp.SetValue(entity, status);
                 }
                 
-                // Set timestamps based on status
-                if (status == "running")
+                // Set timestamps based on status.
+                // The live test pipeline writes 'processing' then 'executing' and never
+                // 'running', so stamping only on "running" left StartedAt permanently null
+                // and broke every duration fallback that depended on it. Stamp on the first
+                // active status and never re-stamp.
+                if (status == "running" || status == "processing" || status == "executing")
                 {
                     var startedProp = entity.GetType().GetProperty("StartedAt");
                     if (startedProp != null)
                     {
-                        startedProp.SetValue(entity, DateTime.Now);
+                        var existing = startedProp.GetValue(entity);
+                        bool alreadyStamped = existing is DateTime stamped
+                            ? stamped != default(DateTime)
+                            : existing != null;
+
+                        if (!alreadyStamped)
+                        {
+                            startedProp.SetValue(entity, DateTime.Now);
+                        }
                     }
                 }
-                else if (status == "completed" || status == "failed" || status == "cancelled")
+                else if (CompletionStatuses.Contains(status))
                 {
                     var completedProp = entity.GetType().GetProperty("CompletedAt");
                     if (completedProp != null)
@@ -377,6 +392,21 @@ namespace PerSpec.Editor.Coordination
             }
         }
         
+        /// <summary>
+        /// Statuses that end a request. 'timeout' and 'inconclusive' used to be missing
+        /// from the CompletedAt branch above, so UpdateRequestStatus(id, "inconclusive", ...)
+        /// - which RecoverOrphanedRequests really does call - wrote a terminal status with
+        /// a NULL completed_at, and every reader keyed off that column saw a finished
+        /// request as still running.
+        ///
+        /// Safe to widen: the only other writers of those two statuses go through
+        /// UpdateRequestResults, which stamps CompletedAt unconditionally.
+        /// </summary>
+        private static readonly HashSet<string> CompletionStatuses = new HashSet<string>
+        {
+            "completed", "failed", "cancelled", "timeout", "inconclusive", "no_match"
+        };
+
         public string GetRequestStatus(int requestId)
         {
             if (!_isInitialized) return null;
@@ -418,13 +448,18 @@ namespace PerSpec.Editor.Coordination
             }
         }
         
-        public void UpdateRequestResults(int requestId, string status, int totalTests, int passedTests, 
-                                        int failedTests, int skippedTests, float duration)
+        /// <param name="errorMessage">
+        /// Optional explanation stored alongside the counts. Needed because a run can now finish
+        /// with results that do not match its filter - the counts alone cannot say why.
+        /// </param>
+        public void UpdateRequestResults(int requestId, string status, int totalTests, int passedTests,
+                                        int failedTests, int skippedTests, float duration,
+                                        string errorMessage = null)
         {
             try
             {
                 var request = _connection.Table<TestRequest>().FirstOrDefault(r => r.Id == requestId);
-                
+
                 if (request != null)
                 {
                     request.Status = status;
@@ -434,7 +469,12 @@ namespace PerSpec.Editor.Coordination
                     request.FailedTests = failedTests;
                     request.SkippedTests = skippedTests;
                     request.DurationSeconds = duration;
-                    
+
+                    if (!string.IsNullOrEmpty(errorMessage))
+                    {
+                        request.ErrorMessage = errorMessage;
+                    }
+
                     _connection.Update(request);
                 }
             }
@@ -788,15 +828,20 @@ namespace PerSpec.Editor.Coordination
         
         public List<AssetRefreshRequest> GetRunningRefreshRequests()
         {
+            return GetRefreshRequestsByStatus("running");
+        }
+
+        public List<AssetRefreshRequest> GetRefreshRequestsByStatus(string status)
+        {
             try
             {
                 return _connection.Table<AssetRefreshRequest>()
-                    .Where(r => r.Status == "running")
+                    .Where(r => r.Status == status)
                     .ToList();
             }
             catch (Exception e)
             {
-                Debug.LogError($"[SQLiteManager] Error getting running refresh requests: {e.Message}");
+                Debug.LogError($"[SQLiteManager] Error getting refresh requests with status '{status}': {e.Message}");
                 return new List<AssetRefreshRequest>();
             }
         }
@@ -1073,7 +1118,8 @@ namespace PerSpec.Editor.Coordination
                 int deletedResults = _connection.Execute("DELETE FROM test_results WHERE created_at < ?", cutoffTime);
                 
                 // Delete old test requests
-                int deletedRequests = _connection.Execute("DELETE FROM test_requests WHERE created_at < ? AND status IN ('completed', 'failed', 'cancelled', 'inconclusive')", cutoffTime);
+                // Must list EVERY terminal status: one left out is a row that is never cleaned.
+                int deletedRequests = _connection.Execute("DELETE FROM test_requests WHERE created_at < ? AND status IN ('completed', 'failed', 'cancelled', 'timeout', 'inconclusive', 'no_match')", cutoffTime);
                 
                 if (deletedResults > 0 || deletedRequests > 0)
                 {

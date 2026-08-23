@@ -6,6 +6,7 @@ using UnityEngine;
 using UnityEditor;
 using PerSpec.Editor.Services;
 using PerSpec.Editor.Coordination;
+using PerSpec.Editor.Initialization;
 
 namespace PerSpec.Editor.Windows
 {
@@ -359,6 +360,28 @@ namespace PerSpec.Editor.Windows
             {
                 // Show database size
                 var dbManager = new SQLiteManager();
+
+                // Initialize / Migrate Database - always available, even when the DB is missing
+                // or has a stale schema. Creates the DB if absent and self-heals constraints
+                // (e.g. the asset_refresh_requests 'compiling' status) via the C# repair, then
+                // runs the full Python migration sweep.
+                if (GUILayout.Button("Initialize / Migrate Database", GUILayout.Height(30)))
+                {
+                    if (EditorUtility.DisplayDialog("Initialize / Migrate Database",
+                        "Creates the database if it is missing and upgrades its schema to the " +
+                        "current version (e.g. adds the 'compiling' refresh status). Safe to run anytime.\n\nContinue?",
+                        "Run", "Cancel"))
+                    {
+                        bool ready = DatabaseInitializer.EnsureDatabaseReady();
+                        DatabaseMaintenanceRunner.RunMaintenanceManually();
+                        ShowNotification(new GUIContent(ready
+                            ? "Database initialized / migrated"
+                            : "Database init reported an error - check Console"));
+                    }
+                }
+
+                EditorGUILayout.Space(5);
+
                 if (dbManager.IsInitialized)
                 {
                     long dbSize = dbManager.GetDatabaseSize();

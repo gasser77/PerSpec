@@ -14,7 +14,18 @@ os.environ['PYTHONDONTWRITEBYTECODE'] = '1'
 import sqlite3
 from pathlib import Path
 import json
-from datetime import datetime
+from datetime import datetime, timedelta
+
+_DOTNET_EPOCH = datetime(1, 1, 1)
+
+def _dotnet_ticks_days_ago(days: int) -> int:
+    """Return a .NET DateTime tick count for `days` ago in local time.
+
+    Mirrors test_coordinator._dotnet_ticks_now so cleanup cutoffs are comparable
+    with the tick values actually stored in created_at columns.
+    """
+    delta = (datetime.now() - timedelta(days=days)) - _DOTNET_EPOCH
+    return delta.days * 864_000_000_000 + delta.seconds * 10_000_000 + delta.microseconds * 10
 
 def get_project_root():
     """Find Unity project root by looking for Assets folder"""
@@ -43,10 +54,13 @@ def get_schema_version(conn):
         if not cursor.fetchone():
             return 0
         
-        # Get current version
-        cursor.execute("SELECT version FROM schema_version ORDER BY applied_at DESC LIMIT 1")
+        # Get current version. Use MAX(version) rather than the most-recent applied_at:
+        # CURRENT_TIMESTAMP has 1-second resolution, so migrations applied in the same
+        # second tie on applied_at and can be returned out of order, causing the last
+        # migration to be re-run (harmlessly) on every invocation.
+        cursor.execute("SELECT MAX(version) FROM schema_version")
         result = cursor.fetchone()
-        return result[0] if result else 0
+        return result[0] if result and result[0] is not None else 0
     except:
         return 0
 
@@ -204,12 +218,29 @@ def apply_migration_v3(conn):
     cursor = conn.cursor()
     
     try:
-        # Clean old test requests (older than 7 days)
+        # Clean old test requests (older than 7 days).
+        #
+        # created_at is stored either as an INT64 .NET tick count (sqlite-net on the
+        # Unity side, and Python inserts, both use ticks) or as legacy TEXT. SQLite
+        # sorts every INTEGER before every TEXT, so comparing a tick value against
+        # datetime('now', ...) is unconditionally true and would delete live rows -
+        # including the request a --wait is currently polling. Compare each storage
+        # class against a cutoff of its own type.
+        cutoff_ticks = _dotnet_ticks_days_ago(7)
+
         cursor.execute("""
-            DELETE FROM test_requests 
-            WHERE created_at < datetime('now', '-7 days')
-        """)
+            DELETE FROM test_requests
+            WHERE typeof(created_at) IN ('integer', 'real')
+              AND created_at < ?
+        """, (cutoff_ticks,))
         deleted_tests = cursor.rowcount
+
+        cursor.execute("""
+            DELETE FROM test_requests
+            WHERE typeof(created_at) = 'text'
+              AND created_at < datetime('now', '-7 days')
+        """)
+        deleted_tests += cursor.rowcount
         
         # Clean old test results
         cursor.execute("""
@@ -332,6 +363,157 @@ def apply_migration_v5(conn):
         return False
 
 
+def apply_migration_v6(conn):
+    """Migration v6: Add 'compiling' to asset_refresh_requests status CHECK constraint.
+
+    Enables two-phase refresh completion: Unity marks a refresh 'compiling' while
+    scripts recompile + domain reload, and only writes 'completed' once that finishes.
+    Targets the real 'asset_refresh_requests' table (note: the legacy v2 migration
+    targeted a phantom 'refresh_requests' name and never touched this table).
+    """
+    print("  Applying Migration v6: Add 'compiling' refresh status value...")
+    cursor = conn.cursor()
+
+    try:
+        cursor.execute("""
+            SELECT sql FROM sqlite_master
+            WHERE type='table' AND name='asset_refresh_requests'
+        """)
+        result = cursor.fetchone()
+        if not result or not result[0]:
+            print("    asset_refresh_requests table missing - skipping")
+            return True
+
+        if "'compiling'" in result[0]:
+            print("    'compiling' already present - skipping")
+            return True
+
+        print("    Rebuilding asset_refresh_requests to add 'compiling'...")
+
+        cursor.execute("DROP TABLE IF EXISTS asset_refresh_requests_new")
+        cursor.execute("""
+            CREATE TABLE asset_refresh_requests_new (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                refresh_type TEXT NOT NULL DEFAULT 'full' CHECK(refresh_type IN ('full', 'selective')),
+                paths TEXT,
+                import_options TEXT DEFAULT 'default' CHECK(import_options IN ('default', 'synchronous', 'force_update')),
+                status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending', 'running', 'compiling', 'completed', 'failed', 'cancelled')),
+                priority INTEGER DEFAULT 0,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                started_at TIMESTAMP,
+                completed_at TIMESTAMP,
+                duration_seconds REAL DEFAULT 0.0,
+                result_message TEXT,
+                error_message TEXT
+            )
+        """)
+
+        cursor.execute("""
+            INSERT INTO asset_refresh_requests_new (
+                id, refresh_type, paths, import_options, status, priority,
+                created_at, started_at, completed_at, duration_seconds,
+                result_message, error_message
+            )
+            SELECT
+                id, refresh_type, paths, import_options, status, priority,
+                created_at, started_at, completed_at, duration_seconds,
+                result_message, error_message
+            FROM asset_refresh_requests
+        """)
+
+        cursor.execute("DROP TABLE asset_refresh_requests")
+        cursor.execute("ALTER TABLE asset_refresh_requests_new RENAME TO asset_refresh_requests")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_refresh_status ON asset_refresh_requests(status)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_refresh_created ON asset_refresh_requests(created_at DESC)")
+
+        print("    'compiling' added to status constraint")
+        return True
+    except Exception as e:
+        print(f"    Error in migration v6: {e}")
+        return False
+
+
+def apply_migration_v7(conn):
+    """Migration v7: Add 'no_match' to test_requests status CHECK constraint.
+
+    'no_match' is the terminal status for a request whose filter resolved to zero
+    tests - a caller mistake, detected before any test runs. It used to be folded
+    into 'inconclusive' alongside "tests ran but all skipped" and "compilation
+    errors blocked the run", which made a typo indistinguishable from a condition
+    of the project. Without this constraint value the write is rejected, the error
+    is swallowed, and the row is stranded mid-flight.
+    """
+    print("  Applying Migration v7: Add 'no_match' status value...")
+    cursor = conn.cursor()
+
+    try:
+        cursor.execute("""
+            SELECT sql FROM sqlite_master
+            WHERE type='table' AND name='test_requests'
+        """)
+        result = cursor.fetchone()
+        if not result or not result[0]:
+            print("    test_requests table missing - skipping")
+            return True
+
+        if "'no_match'" in result[0]:
+            print("    'no_match' already present - skipping")
+            return True
+
+        print("    Rebuilding test_requests to add 'no_match'...")
+
+        cursor.execute("DROP TABLE IF EXISTS test_requests_new")
+        cursor.execute("""
+            CREATE TABLE test_requests_new (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                request_type TEXT NOT NULL,
+                test_filter TEXT,
+                test_platform TEXT NOT NULL,
+                priority INTEGER DEFAULT 0,
+                status TEXT DEFAULT 'pending' CHECK(status IN (
+                    'pending', 'processing', 'executing', 'finalizing',
+                    'running', 'completed', 'failed', 'timeout',
+                    'cancelled', 'inconclusive', 'no_match'
+                )),
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                started_at TIMESTAMP,
+                completed_at TIMESTAMP,
+                total_tests INTEGER,
+                passed_tests INTEGER,
+                failed_tests INTEGER,
+                skipped_tests INTEGER,
+                duration_seconds REAL,
+                error_message TEXT
+            )
+        """)
+
+        cursor.execute("""
+            INSERT INTO test_requests_new (
+                id, request_type, test_filter, test_platform, priority,
+                status, created_at, started_at, completed_at,
+                total_tests, passed_tests, failed_tests, skipped_tests,
+                duration_seconds, error_message
+            )
+            SELECT
+                id, request_type, test_filter, test_platform, priority,
+                status, created_at, started_at, completed_at,
+                total_tests, passed_tests, failed_tests, skipped_tests,
+                duration_seconds, error_message
+            FROM test_requests
+        """)
+
+        cursor.execute("DROP TABLE test_requests")
+        cursor.execute("ALTER TABLE test_requests_new RENAME TO test_requests")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_test_requests_status ON test_requests(status)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_test_requests_created ON test_requests(created_at)")
+
+        print("    'no_match' added to status constraint")
+        return True
+    except Exception as e:
+        print(f"    Error in migration v7: {e}")
+        return False
+
+
 def run_maintenance():
     """Run all database maintenance tasks"""
     print("\n" + "="*60)
@@ -363,6 +545,8 @@ def run_maintenance():
             (3, "Clean old data and optimize", apply_migration_v3),
             (4, "Add performance indexes", apply_migration_v4),
             (5, "Add 'inconclusive' status value", apply_migration_v5),
+            (6, "Add 'compiling' refresh status value", apply_migration_v6),
+            (7, "Add 'no_match' status value", apply_migration_v7),
         ]
         
         # Apply pending migrations

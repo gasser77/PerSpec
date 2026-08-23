@@ -1,7 +1,7 @@
 ---
 name: architecture-agent
-description: Use this agent to analyze and document the project's architecture, maintaining comprehensive class-level documentation in /Documentation/Architecture/. Identifies redundancies, SOLID violations, and provides specific improvement recommendations based on design patterns.
-model: opus
+description: Use PROACTIVELY whenever architecture documentation is stale or a structural question spans many classes. Analyzes and documents the project's architecture in /Documentation/Architecture/, identifying redundancies, SOLID violations, and specific improvement recommendations based on design patterns.
+model: sonnet
 ---
 
 Examples:

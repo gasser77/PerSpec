@@ -26,6 +26,7 @@ REQUIRED_STATUSES = (
     'timeout',
     'cancelled',
     'inconclusive',
+    'no_match',
 )
 
 def get_project_root():
@@ -96,7 +97,7 @@ def update_status_constraint():
                 status TEXT DEFAULT 'pending' CHECK(status IN (
                     'pending', 'processing', 'executing', 'finalizing',
                     'running', 'completed', 'failed', 'timeout',
-                    'cancelled', 'inconclusive'
+                    'cancelled', 'inconclusive', 'no_match'
                 )),
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 started_at TIMESTAMP,
@@ -162,7 +163,7 @@ def update_status_constraint():
             VALUES ('test', 'EditMode', 'processing')
         """)
         test_id = cursor.lastrowid
-        for status in ('executing', 'finalizing', 'inconclusive', 'timeout'):
+        for status in ('executing', 'finalizing', 'inconclusive', 'timeout', 'no_match'):
             cursor.execute(
                 "UPDATE test_requests SET status = ? WHERE id = ?",
                 (status, test_id),
@@ -206,6 +207,7 @@ if __name__ == "__main__":
         print("  - timeout (execution timed out)")
         print("  - cancelled (user cancelled)")
         print("  - inconclusive (test ran but no usable results)")
+        print("  - no_match (the filter matched zero tests - nothing ran)")
         print("  - running (legacy, same as executing)")
     else:
         print("\n[FAILED] Update failed!")
