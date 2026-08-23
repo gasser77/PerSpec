@@ -52,6 +52,8 @@ namespace PerSpec.UnityHelper.Editor
                         return AddToBuildSettings(task);
                     case "RenameGameObject":
                         return RenameGameObject(task);
+                    case "RevertPrefabInstance":
+                        return RevertPrefabInstance(task);
                     case "CreateScriptableObject":
                         return CreateScriptableObject(task);
                     case "SaveAsPrefab":
@@ -194,7 +196,31 @@ namespace PerSpec.UnityHelper.Editor
                 return null;
             }
 
-            return GameObject.Find(path);
+            var active = GameObject.Find(path);
+            if (active != null) return active;
+
+            // GameObject.Find only sees ACTIVE objects. For full "Root/Sub/Path" forms, resolve
+            // the root across all loaded scenes and descend with Transform.Find, which DOES include
+            // inactive children — so scenarios can target disabled objects (dropdown templates,
+            // hidden panels, etc.). Bare single names stay active-only to avoid ambiguous matches.
+            int slash = path.IndexOf('/');
+            if (slash > 0)
+            {
+                string rootName = path.Substring(0, slash);
+                string sub = path.Substring(slash + 1);
+                for (int i = 0; i < UnityEngine.SceneManagement.SceneManager.sceneCount; i++)
+                {
+                    var scene = UnityEngine.SceneManagement.SceneManager.GetSceneAt(i);
+                    if (!scene.isLoaded) continue;
+                    foreach (var sceneRoot in scene.GetRootGameObjects())
+                    {
+                        if (sceneRoot.name != rootName) continue;
+                        var t = sceneRoot.transform.Find(sub);
+                        if (t != null) return t.gameObject;
+                    }
+                }
+            }
+            return null;
         }
 
         private bool CreateScene(Task task)
@@ -1198,8 +1224,51 @@ namespace PerSpec.UnityHelper.Editor
             return true;
         }
         
-        private bool RenameGameObject(Task task) 
-        { 
+        // RevertPrefabInstance — remove ALL instance overrides from a scene prefab instance so
+        // it mirrors the prefab asset exactly (PrefabEditRules.md Case 1: the prefab is the
+        // single source of truth; scenes should carry zero redundant overrides). The instance
+        // GameObject's NAME is preserved by default because scenes commonly rename the instance
+        // (e.g. SecretScreenView.prefab instanced as "SecretView") and code finds it by path.
+        private bool RevertPrefabInstance(Task task)
+        {
+            string path = GetParam(task, "path");
+            if (string.IsNullOrEmpty(path))
+            {
+                task.error = "RevertPrefabInstance requires 'path' parameter";
+                return false;
+            }
+
+            var go = FindInActiveContext(path);
+            if (go == null)
+            {
+                task.error = $"GameObject not found: {path}";
+                return false;
+            }
+
+            var root = PrefabUtility.GetOutermostPrefabInstanceRoot(go);
+            if (root == null)
+            {
+                task.error = $"'{path}' is not part of a prefab instance";
+                return false;
+            }
+
+            bool keepName = GetParam(task, "keepName") != "false";
+            string originalName = root.name;
+
+            PrefabUtility.RevertPrefabInstance(root, InteractionMode.AutomatedAction);
+            if (keepName && root.name != originalName)
+            {
+                root.name = originalName;
+            }
+            EditorUtility.SetDirty(root);
+
+            task.result = $"Reverted all instance overrides on '{originalName}' (name preserved: {keepName})";
+            Debug.Log($"[SceneTaskExecutor] RevertPrefabInstance: {task.result}");
+            return true;
+        }
+
+        private bool RenameGameObject(Task task)
+        {
             string path = GetParam(task, "path");
             string newName = GetParam(task, "newName");
             

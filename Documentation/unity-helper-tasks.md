@@ -1096,6 +1096,21 @@ Destroys a component on a GameObject. Idempotent: if the component is already ab
 - `path` (required): GameObject path.
 - `component` (required): assembly-qualified component type name.
 
+### RevertPrefabInstance
+Removes ALL instance overrides from a scene prefab instance so it mirrors the prefab asset exactly (see the project's `PrefabEditRules.md` Case 1 — prefab is the single source of truth). Resolves the outermost prefab instance root from the given path.
+```json
+{
+    "action": "RevertPrefabInstance",
+    "parameters": [
+        { "key": "path", "value": "SecretView" },
+        { "key": "keepName", "value": "true" }
+    ]
+}
+```
+- `path` (required): the prefab instance root (or any child of it) in the scene.
+- `keepName` (optional, default `"true"`): preserve the instance GameObject's scene name — instances are often renamed (prefab `SecretScreenView` instanced as `SecretView`) and code finds them by path. Pass `"false"` to let the revert restore the prefab's root name too.
+- Follow with `SaveScene` to persist. Typical flow after moving shared changes into a prefab: `LoadScene` → `RevertPrefabInstance` → re-apply any genuinely scene-local values → `SaveScene`.
+
 ### RenameGameObject
 Renames a GameObject. Idempotent: if a GameObject with the target name already exists at the resolved location, succeeds without modifying anything.
 ```json
@@ -1335,6 +1350,15 @@ Import a `.unitypackage` into the project via `AssetDatabase.ImportPackage` (non
 - `interactive` (optional, default `"false"`): `"true"` shows Unity's import-selection dialog (blocks automation — avoid in scenarios).
 - Result: `"Import requested: <file>"`. Completion/failure is logged (`✓ unitypackage import completed` / `✗ unitypackage import FAILED`).
 - ⚠️ Script-bearing packages recompile/domain-reload AFTER the task completes — always follow the scenario with `quick_refresh.py full --focus --wait` + `monitor_editmode_logs.py --errors` before using the imported types.
+
+## GameObject Path Resolution — Inactive Objects (2026-08-07)
+
+All scene-context actions that take a `path` (SetProperty, GetProperty, InspectGameObject, SetActive, CallMethod, value-side scene-path references, …) resolve it via a shared finder:
+
+1. Active objects resolve exactly like `GameObject.Find` (unchanged fast path).
+2. **Full paths of the form `Root/Sub/Path` now ALSO resolve INACTIVE objects**: the root name is matched against every loaded scene's root GameObjects, then the rest of the path descends with `Transform.Find`, which includes inactive children. Use this to target disabled UI such as TMP dropdown `Template` objects or hidden panels.
+3. **Bare single names remain active-only** — give the full path when the target may be inactive.
+4. In Prefab Mode (`OpenPrefab`), paths resolve inside the open prefab (inactive included) as before.
 
 ## Common Mistakes to Avoid
 
