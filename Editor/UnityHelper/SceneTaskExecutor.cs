@@ -3849,9 +3849,16 @@ namespace PerSpec.UnityHelper.Editor
                 case Enum e:
                     return $"{{\"type\":\"{typeName}\",\"value\":\"{e}\",\"intValue\":{Convert.ToInt32(e)}}}";
                 case UnityEngine.Object uo:
-                    return uo == null
-                        ? $"{{\"type\":\"{typeName}\",\"value\":null}}"
-                        : $"{{\"type\":\"{typeName}\",\"value\":{{\"name\":\"{EscapeJson(uo.name)}\",\"type\":\"{uo.GetType().Name}\",\"instanceId\":{uo.GetInstanceID()}}}}}";
+                    if (uo == null)
+                        return $"{{\"type\":\"{typeName}\",\"value\":null}}";
+                    // Unity 6000.4+ replaces the 32-bit InstanceID with the 64-bit EntityId
+                    // (GetInstanceID is CS0619 in 6000.6); emitted as a JSON string there.
+#if UNITY_6000_4_OR_NEWER
+                    var unityObjectId = $"\"{uo.GetEntityId()}\"";
+#else
+                    var unityObjectId = uo.GetInstanceID().ToString();
+#endif
+                    return $"{{\"type\":\"{typeName}\",\"value\":{{\"name\":\"{EscapeJson(uo.name)}\",\"type\":\"{uo.GetType().Name}\",\"instanceId\":{unityObjectId}}}}}";
                 default:
                     return $"{{\"type\":\"{typeName}\",\"value\":\"{EscapeJson(value.ToString())}\"}}";
             }
