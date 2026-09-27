@@ -153,7 +153,9 @@ namespace PerSpec.UnityHelper.Editor
 #if HAS_UNITY_LOCALIZATION
                 TaskExecutorRegistry.Register(new LocalizationTaskExecutor());
 #endif
+#if HAS_UNITY_TEXTMESHPRO
                 TaskExecutorRegistry.Register(new TmproTaskExecutor());
+#endif
 
                 EditorApplication.update += OnEditorUpdate;
                 _lastCheckTime = EditorApplication.timeSinceStartup;

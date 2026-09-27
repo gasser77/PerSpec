@@ -5,8 +5,9 @@ using System;
 using System.Collections.Generic;
 using System.Linq;
 using System.Reflection;
+#if HAS_UNITY_UGUI
 using UnityEngine.UI;
-using TMPro;
+#endif
 
 namespace PerSpec.UnityHelper.Editor
 {
@@ -678,6 +679,7 @@ namespace PerSpec.UnityHelper.Editor
                 return false;
             }
 
+#if HAS_UNITY_UGUI
             // Handle sprite field specially for Image component
             if (fieldName == "sprite" && component is Image image)
             {
@@ -703,6 +705,7 @@ namespace PerSpec.UnityHelper.Editor
                 Debug.Log($"[SceneTaskExecutor] SetProperty: {goPath}/{componentName}.{fieldName} = {valuePath} ✓");
                 return true;
             }
+#endif
 
             // Use reflection for other fields
             var field = componentType.GetField(fieldName, System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
@@ -1157,12 +1160,14 @@ namespace PerSpec.UnityHelper.Editor
             var canvas = canvasGO.AddComponent<Canvas>();
             canvas.renderMode = RenderMode.ScreenSpaceOverlay;
             
+#if HAS_UNITY_UGUI
             var scaler = canvasGO.AddComponent<CanvasScaler>();
             scaler.uiScaleMode = CanvasScaler.ScaleMode.ScaleWithScreenSize;
             scaler.referenceResolution = new Vector2(1920, 1080);
             scaler.matchWidthOrHeight = 0.5f;
             
             canvasGO.AddComponent<GraphicRaycaster>();
+#endif
             
             // TODO: VERIFY Canvas was created and has all required components
             // if (FindInActiveContext(name)?.GetComponent<Canvas>() == null) return false;
@@ -3539,12 +3544,14 @@ namespace PerSpec.UnityHelper.Editor
                 string fieldName = kvp.Key;
                 string valuePath = kvp.Value;
 
+#if HAS_UNITY_UGUI
                 if (fieldName == "color" && component is Graphic graphic)
                 {
                     graphic.color = ParseColor(valuePath);
                     setCount++;
                     continue;
                 }
+#endif
 
                 var field = type.GetField(fieldName,
                     System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
@@ -3680,6 +3687,7 @@ namespace PerSpec.UnityHelper.Editor
 
         private object ParseTextAlignment(string value)
         {
+#if HAS_UNITY_TEXTMESHPRO
             // Try numeric first
             if (int.TryParse(value, out int numericValue))
                 return (TMPro.TextAlignmentOptions)numericValue;
@@ -3698,6 +3706,9 @@ namespace PerSpec.UnityHelper.Editor
                 case "justified": case "topjustified": return TMPro.TextAlignmentOptions.TopJustified;
                 default: return null;
             }
+#else
+            return null;
+#endif
         }
 
         // ============================================================

@@ -6,6 +6,7 @@
         "PerSpec.Editor.Coordination",
         "Gilzoide.SqliteNet",
         "UniTask",
+        "UnityEngine.UI",
         "Unity.TextMeshPro",
         "UnityEngine.TestRunner",
         "UnityEditor.TestRunner",
@@ -26,6 +27,21 @@
             "name": "com.unity.localization",
             "expression": "1.0.0",
             "define": "HAS_UNITY_LOCALIZATION"
+        },
+        {
+            "name": "com.unity.ugui",
+            "expression": "1.0.0",
+            "define": "HAS_UNITY_UGUI"
+        },
+        {
+            "name": "com.unity.ugui",
+            "expression": "2.0.0",
+            "define": "HAS_UNITY_TEXTMESHPRO"
+        },
+        {
+            "name": "com.unity.textmeshpro",
+            "expression": "1.0.0",
+            "define": "HAS_UNITY_TEXTMESHPRO"
         }
     ],
     "noEngineReferences": false

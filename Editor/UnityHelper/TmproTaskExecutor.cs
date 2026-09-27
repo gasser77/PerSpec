@@ -1,3 +1,4 @@
+#if HAS_UNITY_TEXTMESHPRO
 // TmproTaskExecutor — TYPE 2 TMPRO module.
 //
 // Package-specific module per rules.md §"UnityHelper Modification Rules" Rule 2 — TextMeshPro
@@ -311,3 +312,4 @@ namespace PerSpec.UnityHelper.Editor
         }
     }
 }
+#endif

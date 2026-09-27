@@ -27,6 +27,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `Documentation/unity-helper-tasks.md` (1219 lines): documented every dispatched scene action — 43 scene + 17 localization sections, plus the `Validate hasComponent` extension.
 - `Documentation/LLM.md`: added "Unity Helper — Augmented Toolbox" section with explicit pre-flight instructions for AI agents to load the action catalogue and JSON Schemas before authoring scenarios/recipes/validator-rules.
 
+### Fixed
+- **TextMeshPro and uGUI are now optional for the Unity Helper assembly.** `PerSpec.Editor.UnityHelper.asmdef` gains `HAS_UNITY_UGUI` (com.unity.ugui >= 1.0.0) and `HAS_UNITY_TEXTMESHPRO` (com.unity.ugui >= 2.0.0, or com.unity.textmeshpro >= 1.0.0 on older editors) version defines, mirroring `HAS_UNITY_LOCALIZATION`. `TmproTaskExecutor` and its registration, the `TextAlignmentOptions` shorthand, and the `Image` / `Graphic` / `CanvasScaler` / `GraphicRaycaster` paths in `SceneTaskExecutor` are guarded; unused `UnityEngine.UI` / `TMPro` usings in `ScenarioRunner` removed. A project without com.unity.ugui previously failed with CS0234/CS0246 in three files.
+
 ## [1.13.0] - 2026-09-18
 
 ### Added

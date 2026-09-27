@@ -1,8 +1,6 @@
 using UnityEditor;
 using UnityEditor.SceneManagement;
 using UnityEngine;
-using UnityEngine.UI;
-using TMPro;
 using System.IO;
 using System.Collections.Generic;
 using System;
@@ -43,7 +41,9 @@ namespace PerSpec.UnityHelper.Editor
 #if HAS_UNITY_LOCALIZATION
             TaskExecutorRegistry.Register(new LocalizationTaskExecutor());
 #endif
+#if HAS_UNITY_TEXTMESHPRO
             TaskExecutorRegistry.Register(new TmproTaskExecutor());
+#endif
         }
 
         private void OnFocus()
