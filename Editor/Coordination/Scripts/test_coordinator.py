@@ -649,6 +649,33 @@ class TestCoordinator:
 
         return max(0.0, (datetime.now() - parsed).total_seconds())
 
+    def is_unity_in_play_mode(self, max_age_seconds: float = 30.0) -> bool:
+        """Whether a live Unity Editor reports it is in (or entering) Play Mode.
+
+        Unity puts 'PlayMode' in the heartbeat's message column while playing. A stale
+        heartbeat means the editor is gone, so it never counts as playing.
+        """
+        conn = self._get_connection()
+        try:
+            cursor = conn.cursor()
+            cursor.execute("""
+                SELECT message, last_heartbeat FROM system_status
+                WHERE component = 'Unity'
+                ORDER BY last_heartbeat DESC
+                LIMIT 1
+            """)
+            row = cursor.fetchone()
+        except sqlite3.Error:
+            return False
+        finally:
+            conn.close()
+
+        if not row or row['message'] != 'PlayMode' or row['last_heartbeat'] is None:
+            return False
+
+        parsed = self._parse_request_timestamp(row['last_heartbeat'])
+        return parsed is not None and (datetime.now() - parsed).total_seconds() <= max_age_seconds
+
     def is_unity_alive(self, max_age_seconds: float = 15.0) -> bool:
         """Whether the Unity Editor has checked in recently enough to be running."""
         age = self.seconds_since_unity_heartbeat()
@@ -820,6 +847,13 @@ def run_test_category(category: str, platform: TestPlatform = TestPlatform.BOTH)
     """Run tests by category"""
     coordinator = TestCoordinator()
     return coordinator.submit_test_request(TestRequestType.CATEGORY, platform, category)
+
+def unity_in_play_mode() -> bool:
+    """is_unity_in_play_mode() that never raises; a missing database means 'not playing'."""
+    try:
+        return TestCoordinator().is_unity_in_play_mode()
+    except Exception:
+        return False
 
 if __name__ == "__main__":
     # Example usage

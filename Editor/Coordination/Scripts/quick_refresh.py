@@ -44,7 +44,14 @@ def main():
         'force_update': ImportOptions.FORCE_UPDATE
     }
     import_options = options_map[args.options]
-    
+
+    # Unity does not recompile mid-play, so a refresh would only wait. Report success.
+    if args.action in ('full', 'paths'):
+        from test_coordinator import unity_in_play_mode
+        if unity_in_play_mode():
+            print("[SKIPPED] Unity is in Play Mode - refresh skipped")
+            sys.exit(0)
+
     coordinator = AssetRefreshCoordinator()
     
     try:

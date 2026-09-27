@@ -27,6 +27,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `Documentation/unity-helper-tasks.md` (1219 lines): documented every dispatched scene action — 43 scene + 17 localization sections, plus the `Validate hasComponent` extension.
 - `Documentation/LLM.md`: added "Unity Helper — Augmented Toolbox" section with explicit pre-flight instructions for AI agents to load the action catalogue and JSON Schemas before authoring scenarios/recipes/validator-rules.
 
+## [1.13.0] - 2026-09-18
+
+### Added
+- **Refresh and compile-error checks are skipped while Unity is in Play Mode**
+  - `quick_refresh.py full|paths` and `monitor_editmode_logs.py --errors` now print
+    `[SKIPPED] Unity is in Play Mode ...` and exit 0 when the editor is playing. Unity does
+    not recompile mid-play, so a refresh only waited out its timeout.
+  - Signal: Unity's heartbeat (`system_status`, component `Unity`) now writes `PlayMode`
+    instead of `Active` to the `message` column while `isPlayingOrWillChangePlaymode`.
+    `message` is used because `status` is CHECK-constrained; no migration needed.
+  - A heartbeat older than 30s never counts as playing, so a closed editor never causes a skip.
+  - New `TestCoordinator.is_unity_in_play_mode()` and the non-raising `unity_in_play_mode()` helper.
+
 ## [1.12.0] - 2026-08-21
 
 ### Added

@@ -337,6 +337,8 @@ finished.
 
 Special case: if compilation finished **with errors**, no domain reload happens, so the request still ends as **`completed`** but its summary carries an `error_message` and prints a `[WARNING] Compilation errors detected` line. That is not a refresh failure — step 3 (`monitor_editmode_logs.py --errors`) still owns error triage and MUST be run. `failed` is reserved for the refresh machinery itself breaking (or a request orphaned by a domain reload / editor restart).
 
+**Play Mode:** as of v1.13.0, while Unity is in Play Mode `quick_refresh.py full|paths` and `monitor_editmode_logs.py --errors` print `[SKIPPED] Unity is in Play Mode ...` and exit 0 without doing anything. Exit Play Mode to get a real refresh and error check.
+
 **🚨 CRITICAL PROTOCOL**: 
 1. **ALWAYS** refresh Unity after ANY code change
 2. **ALWAYS** check for compilation errors BEFORE running tests

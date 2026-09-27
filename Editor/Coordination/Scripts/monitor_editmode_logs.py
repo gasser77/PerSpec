@@ -389,6 +389,14 @@ def main():
     
     # Handle error flags
     if args.errors:
+        # Unity does not recompile mid-play, so there is nothing new to check.
+        try:
+            from test_coordinator import unity_in_play_mode
+            if unity_in_play_mode():
+                print("[SKIPPED] Unity is in Play Mode - compile error check skipped")
+                sys.exit(0)
+        except ImportError:
+            pass
         args.command = 'errors'
         args.compilation_only = True
         args.ecs_only = False

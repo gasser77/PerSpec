@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using UnityEngine;
+using UnityEditor;
 using SQLite;
 
 namespace PerSpec.Editor.Coordination
@@ -535,6 +536,9 @@ namespace PerSpec.Editor.Coordination
         
         public void UpdateSystemHeartbeat(string component)
         {
+            // Python reads "PlayMode" to skip refresh and compile-error checks while playing.
+            // The status column is CHECK-constrained, so the play state lives in message.
+            string message = EditorApplication.isPlayingOrWillChangePlaymode ? "PlayMode" : "Active";
             try
             {
                 var status = _connection.Table<SystemStatus>()
@@ -544,7 +548,7 @@ namespace PerSpec.Editor.Coordination
                 {
                     status.Status = "online";
                     status.LastHeartbeat = DateTime.Now;
-                    status.Message = "Active";
+                    status.Message = message;
                     _connection.Update(status);
                 }
                 else
@@ -554,7 +558,7 @@ namespace PerSpec.Editor.Coordination
                         Component = component,
                         Status = "online",
                         LastHeartbeat = DateTime.Now,
-                        Message = "Active"
+                        Message = message
                     });
                 }
             }
